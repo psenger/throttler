@@ -1,79 +1,41 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use envconfig::Envconfig;
+use std::net::SocketAddr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Envconfig, Clone)]
 pub struct Config {
+    /// Server bind address
+    #[envconfig(from = "BIND_ADDR", default = "127.0.0.1:3000")]
+    pub bind_addr: SocketAddr,
+    
+    /// Redis connection URL
+    #[envconfig(from = "REDIS_URL", default = "redis://127.0.0.1:6379")]
     pub redis_url: String,
-    pub default_limits: RateLimit,
-    pub custom_limits: HashMap<String, RateLimit>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimit {
-    pub requests_per_second: u32,
-    pub burst_capacity: u32,
-    pub window_seconds: u32,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let mut custom_limits = HashMap::new();
-        
-        // Example custom limits for different API tiers
-        custom_limits.insert(
-            "premium".to_string(),
-            RateLimit {
-                requests_per_second: 100,
-                burst_capacity: 200,
-                window_seconds: 60,
-            },
-        );
-        
-        custom_limits.insert(
-            "basic".to_string(),
-            RateLimit {
-                requests_per_second: 10,
-                burst_capacity: 20,
-                window_seconds: 60,
-            },
-        );
-
-        Self {
-            redis_url: "redis://localhost:6379".to_string(),
-            default_limits: RateLimit {
-                requests_per_second: 50,
-                burst_capacity: 100,
-                window_seconds: 60,
-            },
-            custom_limits,
-        }
-    }
+    
+    /// Default rate limit requests per second
+    #[envconfig(from = "DEFAULT_RATE_LIMIT", default = "100")]
+    pub default_rate_limit: u32,
+    
+    /// Token bucket capacity multiplier
+    #[envconfig(from = "BUCKET_CAPACITY_MULTIPLIER", default = "2")]
+    pub bucket_capacity_multiplier: u32,
+    
+    /// Rate limiter cleanup interval in seconds
+    #[envconfig(from = "CLEANUP_INTERVAL", default = "300")]
+    pub cleanup_interval_secs: u64,
+    
+    /// Enable request tracing
+    #[envconfig(from = "ENABLE_TRACING", default = "true")]
+    pub enable_tracing: bool,
 }
 
 impl Config {
-    pub fn load(path: &str) -> Result<Self> {
-        let settings = config::Config::builder()
-            .add_source(config::File::with_name(path).required(false))
-            .add_source(config::Environment::with_prefix("THROTTLER"))
-            .build()?;
-
-        match settings.try_deserialize::<Config>() {
-            Ok(config) => Ok(config),
-            Err(_) => {
-                tracing::warn!("Failed to load config from {}, using defaults", path);
-                Ok(Config::default())
-            }
-        }
+    /// Load configuration from environment variables
+    pub fn from_env() -> Result<Self, envconfig::Error> {
+        Config::init_from_env()
     }
-
-    pub fn get_limit_for_key(&self, key: &str) -> &RateLimit {
-        // Try to extract tier from key (e.g., "user:123:premium")
-        for (tier, limit) in &self.custom_limits {
-            if key.contains(tier) {
-                return limit;
-            }
-        }
-        &self.default_limits
+    
+    /// Get bucket capacity based on rate limit
+    pub fn bucket_capacity(&self, rate_limit: u32) -> u32 {
+        rate_limit * self.bucket_capacity_multiplier
     }
 }

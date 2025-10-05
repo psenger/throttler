@@ -1,32 +1,38 @@
+use anyhow::Result;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
 mod config;
 mod rate_limiter;
 mod redis;
 
 use config::Config;
-use std::env;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load configuration from environment or defaults
-    let config = Config::from_env();
+async fn main() -> Result<()> {
+    // Load configuration from environment
+    let config = Config::from_env()
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+
+    // Initialize tracing
+    if config.enable_tracing {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "throttler=debug,tower_http=debug".into()),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    tracing::info!("Starting throttler service");
+    tracing::info!("Configuration: bind_addr={}, redis_url={}", 
+                   config.bind_addr, config.redis_url);
+
+    // TODO: Initialize Redis connection pool
+    // TODO: Initialize rate limiter
+    // TODO: Start HTTP server
     
-    println!("Starting throttler service...");
-    println!("Server will listen on: {}:{}", config.host, config.port);
-    println!("Redis URL: {}", config.redis_url);
-    
-    // Initialize Redis client
-    let redis_client = redis::RedisClient::new(&config.redis_url)?;
-    println!("Redis connection established");
-    
-    // TODO: Initialize web server
-    // TODO: Set up rate limiting middleware
-    // TODO: Configure API routes
-    
-    println!("Throttler service started successfully!");
-    
-    // Keep the service running
-    tokio::signal::ctrl_c().await?;
-    println!("Shutting down throttler service...");
+    tracing::info!("Service would start on {}", config.bind_addr);
     
     Ok(())
 }
