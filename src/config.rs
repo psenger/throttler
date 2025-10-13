@@ -1,105 +1,110 @@
+use serde::{Deserialize, Serialize};
 use std::env;
-use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub server_host: String,
-    pub server_port: u16,
-    pub redis_url: String,
-    pub default_rate_limit: u32,
-    pub default_window_seconds: u64,
-    pub max_bucket_size: u32,
+    pub server: ServerConfig,
+    pub redis: RedisConfig,
+    pub rate_limiting: RateLimitConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub workers: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    pub url: String,
+    pub pool_size: u32,
+    pub connection_timeout: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    pub default_requests_per_second: u32,
+    pub default_burst_capacity: u32,
+    pub cleanup_interval: u64,
+}
+
+#[derive(Error, Debug)]
 pub enum ConfigError {
-    InvalidPort(String),
-    InvalidRateLimit(String),
-    InvalidWindowSize(String),
-    InvalidBucketSize(String),
-    MissingRedisUrl,
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::InvalidPort(msg) => write!(f, "Invalid port: {}", msg),
-            ConfigError::InvalidRateLimit(msg) => write!(f, "Invalid rate limit: {}", msg),
-            ConfigError::InvalidWindowSize(msg) => write!(f, "Invalid window size: {}", msg),
-            ConfigError::InvalidBucketSize(msg) => write!(f, "Invalid bucket size: {}", msg),
-            ConfigError::MissingRedisUrl => write!(f, "Redis URL is required"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server_host: "127.0.0.1".to_string(),
-            server_port: 8080,
-            redis_url: "redis://127.0.0.1:6379".to_string(),
-            default_rate_limit: 100,
-            default_window_seconds: 3600,
-            max_bucket_size: 1000,
-        }
-    }
+    #[error("Environment variable {0} not found")]
+    EnvVarNotFound(String),
+    #[error("Invalid configuration value: {0}")]
+    InvalidValue(String),
+    #[error("Configuration parsing error: {0}")]
+    ParseError(String),
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let mut config = Self::default();
+        dotenv::dotenv().ok(); // Load .env file if present
 
-        if let Ok(host) = env::var("THROTTLER_HOST") {
-            config.server_host = host;
-        }
+        let server = ServerConfig {
+            host: env::var("THROTTLER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+            port: env::var("THROTTLER_PORT")
+                .unwrap_or_else(|_| "3030".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid port: {}", e)))?,
+            workers: env::var("THROTTLER_WORKERS")
+                .ok()
+                .map(|w| w.parse().map_err(|e| ConfigError::InvalidValue(format!("Invalid workers: {}", e))))
+                .transpose()?,
+        };
 
-        if let Ok(port_str) = env::var("THROTTLER_PORT") {
-            config.server_port = port_str.parse()
-                .map_err(|_| ConfigError::InvalidPort(port_str))?;
-        }
+        let redis = RedisConfig {
+            url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+            pool_size: env::var("REDIS_POOL_SIZE")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid pool size: {}", e)))?,
+            connection_timeout: env::var("REDIS_CONNECTION_TIMEOUT")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid timeout: {}", e)))?,
+        };
 
-        if let Ok(redis_url) = env::var("REDIS_URL") {
-            config.redis_url = redis_url;
-        } else if env::var("REDIS_URL").is_err() && config.redis_url.is_empty() {
-            return Err(ConfigError::MissingRedisUrl);
-        }
+        let rate_limiting = RateLimitConfig {
+            default_requests_per_second: env::var("DEFAULT_REQUESTS_PER_SECOND")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid RPS: {}", e)))?,
+            default_burst_capacity: env::var("DEFAULT_BURST_CAPACITY")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid burst capacity: {}", e)))?,
+            cleanup_interval: env::var("CLEANUP_INTERVAL")
+                .unwrap_or_else(|_| "60000".to_string())
+                .parse()
+                .map_err(|e| ConfigError::InvalidValue(format!("Invalid cleanup interval: {}", e)))?,
+        };
 
-        if let Ok(rate_limit_str) = env::var("DEFAULT_RATE_LIMIT") {
-            config.default_rate_limit = rate_limit_str.parse()
-                .map_err(|_| ConfigError::InvalidRateLimit(rate_limit_str))?;
-        }
-
-        if let Ok(window_str) = env::var("DEFAULT_WINDOW_SECONDS") {
-            config.default_window_seconds = window_str.parse()
-                .map_err(|_| ConfigError::InvalidWindowSize(window_str))?;
-        }
-
-        if let Ok(bucket_str) = env::var("MAX_BUCKET_SIZE") {
-            config.max_bucket_size = bucket_str.parse()
-                .map_err(|_| ConfigError::InvalidBucketSize(bucket_str))?;
-        }
-
-        config.validate()?;
-        Ok(config)
+        Ok(Config {
+            server,
+            redis,
+            rate_limiting,
+        })
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.server_port == 0 {
-            return Err(ConfigError::InvalidPort("Port cannot be 0".to_string()));
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.port == 0 {
+            return Err(ConfigError::InvalidValue("Port cannot be 0".to_string()));
         }
 
-        if self.default_rate_limit == 0 {
-            return Err(ConfigError::InvalidRateLimit("Rate limit must be greater than 0".to_string()));
+        if self.redis.pool_size == 0 {
+            return Err(ConfigError::InvalidValue("Redis pool size cannot be 0".to_string()));
         }
 
-        if self.default_window_seconds == 0 {
-            return Err(ConfigError::InvalidWindowSize("Window size must be greater than 0".to_string()));
+        if self.rate_limiting.default_requests_per_second == 0 {
+            return Err(ConfigError::InvalidValue("RPS cannot be 0".to_string()));
         }
 
-        if self.max_bucket_size == 0 {
-            return Err(ConfigError::InvalidBucketSize("Bucket size must be greater than 0".to_string()));
+        if self.rate_limiting.default_burst_capacity == 0 {
+            return Err(ConfigError::InvalidValue("Burst capacity cannot be 0".to_string()));
         }
 
         Ok(())
