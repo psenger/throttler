@@ -1,115 +1,133 @@
-use crate::redis_client::RedisClient;
-use anyhow::Result;
-use std::sync::Arc;
-use tracing::debug;
+use crate::config::RateLimitConfig;
+use crate::error::ThrottlerError;
+use crate::token_bucket::TokenBucket;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-#[derive(Debug, Clone)]
-pub struct TokenBucket {
-    pub key: String,
-    pub tokens: u32,
-    pub capacity: u32,
-    pub refill_rate: u32,
-    pub last_refill: i64,
-}
+pub type RateLimiterResult<T> = Result<T, ThrottlerError>;
 
-#[derive(Debug, Clone)]
-pub struct RateLimitResult {
-    pub allowed: bool,
-    pub tokens_remaining: u32,
-    pub retry_after: Option<u32>,
-    pub reset_time: i64,
-}
-
+#[derive(Debug)]
 pub struct RateLimiter {
-    redis: Arc<RedisClient>,
+    buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
+    default_config: RateLimitConfig,
 }
 
 impl RateLimiter {
-    pub fn new(redis: Arc<RedisClient>) -> Self {
-        Self { redis }
+    pub fn new(config: RateLimitConfig) -> Self {
+        Self {
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            default_config: config,
+        }
     }
 
-    /// Check if a request should be allowed using token bucket algorithm
-    pub async fn check_rate_limit(
-        &self,
-        key: &str,
-        capacity: u32,
-        refill_rate: u32,
-        tokens_requested: u32,
-    ) -> Result<RateLimitResult> {
-        let now = chrono::Utc::now().timestamp();
-        let bucket_key = format!("throttler:bucket:{}", key);
-        
-        // Get current bucket state from Redis
-        let bucket = self.get_or_create_bucket(&bucket_key, capacity, refill_rate, now).await?;
-        
-        // Calculate tokens to add based on time elapsed
-        let time_elapsed = (now - bucket.last_refill).max(0) as u32;
-        let tokens_to_add = (time_elapsed * refill_rate).min(capacity);
-        let current_tokens = (bucket.tokens + tokens_to_add).min(capacity);
-        
-        debug!(
-            "Rate limit check for {}: tokens={}, capacity={}, requested={}",
-            key, current_tokens, capacity, tokens_requested
-        );
-        
-        let allowed = current_tokens >= tokens_requested;
-        let (new_tokens, reset_time) = if allowed {
-            (current_tokens - tokens_requested, now + (capacity / refill_rate) as i64)
-        } else {
-            (current_tokens, now + ((tokens_requested - current_tokens) / refill_rate) as i64)
-        };
-        
-        // Update bucket in Redis
-        let updated_bucket = TokenBucket {
-            key: bucket.key.clone(),
-            tokens: new_tokens,
-            capacity,
-            refill_rate,
-            last_refill: now,
-        };
-        
-        self.save_bucket(&bucket_key, &updated_bucket).await?;
-        
-        let retry_after = if !allowed {
-            Some(((tokens_requested - current_tokens) / refill_rate).max(1))
+    pub fn check_rate_limit(&self, key: &str) -> RateLimiterResult<bool> {
+        self.check_rate_limit_with_tokens(key, 1)
+    }
+
+    pub fn check_rate_limit_with_tokens(&self, key: &str, tokens: u32) -> RateLimiterResult<bool> {
+        let mut buckets = self.buckets.write().map_err(|_| {
+            ThrottlerError::Internal("Failed to acquire write lock".to_string())
+        })?;
+
+        let bucket = buckets.entry(key.to_string()).or_insert_with(|| {
+            TokenBucket::new(
+                self.default_config.burst_size,
+                self.default_config.requests_per_second as f64,
+            )
+        });
+
+        Ok(bucket.try_consume(tokens))
+    }
+
+    pub fn get_rate_limit_status(&self, key: &str) -> RateLimiterResult<RateLimitStatus> {
+        let mut buckets = self.buckets.write().map_err(|_| {
+            ThrottlerError::Internal("Failed to acquire write lock".to_string())
+        })?;
+
+        let bucket = buckets.entry(key.to_string()).or_insert_with(|| {
+            TokenBucket::new(
+                self.default_config.burst_size,
+                self.default_config.requests_per_second as f64,
+            )
+        });
+
+        let available = bucket.available_tokens();
+        let reset_time = if available == 0 {
+            Some(bucket.time_until_available(1))
         } else {
             None
         };
-        
-        Ok(RateLimitResult {
-            allowed,
-            tokens_remaining: new_tokens,
-            retry_after,
-            reset_time,
+
+        Ok(RateLimitStatus {
+            limit: self.default_config.burst_size,
+            remaining: available,
+            reset_after: reset_time,
         })
     }
-    
-    async fn get_or_create_bucket(
-        &self,
-        key: &str,
-        capacity: u32,
-        refill_rate: u32,
-        now: i64,
-    ) -> Result<TokenBucket> {
-        match self.redis.get_bucket(key).await? {
-            Some(bucket) => Ok(bucket),
-            None => Ok(TokenBucket {
-                key: key.to_string(),
-                tokens: capacity,
-                capacity,
-                refill_rate,
-                last_refill: now,
-            }),
+
+    pub fn reset_rate_limit(&self, key: &str) -> RateLimiterResult<()> {
+        let mut buckets = self.buckets.write().map_err(|_| {
+            ThrottlerError::Internal("Failed to acquire write lock".to_string())
+        })?;
+
+        if let Some(bucket) = buckets.get_mut(key) {
+            bucket.reset();
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup_expired(&self) {
+        // This would be implemented with actual expiration logic
+        // For now, we'll keep all buckets
+    }
+}
+
+#[derive(Debug)]
+pub struct RateLimitStatus {
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset_after: Option<Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> RateLimitConfig {
+        RateLimitConfig {
+            requests_per_second: 10,
+            burst_size: 20,
         }
     }
-    
-    async fn save_bucket(&self, key: &str, bucket: &TokenBucket) -> Result<()> {
-        self.redis.save_bucket(key, bucket).await
+
+    #[test]
+    fn test_rate_limiter_allows_requests() {
+        let limiter = RateLimiter::new(test_config());
+        assert!(limiter.check_rate_limit("test-key").unwrap());
     }
-    
-    pub async fn get_stats(&self, key: &str) -> Result<Option<TokenBucket>> {
-        let bucket_key = format!("throttler:bucket:{}", key);
-        self.redis.get_bucket(&bucket_key).await
+
+    #[test]
+    fn test_rate_limiter_blocks_excess_requests() {
+        let limiter = RateLimiter::new(test_config());
+        
+        // Consume all tokens
+        for _ in 0..20 {
+            limiter.check_rate_limit("test-key").unwrap();
+        }
+        
+        // Next request should be blocked
+        assert!(!limiter.check_rate_limit("test-key").unwrap());
+    }
+
+    #[test]
+    fn test_rate_limit_status() {
+        let limiter = RateLimiter::new(test_config());
+        limiter.check_rate_limit_with_tokens("test-key", 5).unwrap();
+        
+        let status = limiter.get_rate_limit_status("test-key").unwrap();
+        assert_eq!(status.limit, 20);
+        assert_eq!(status.remaining, 15);
     }
 }
