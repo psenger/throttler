@@ -8,8 +8,14 @@ pub mod response;
 pub mod server;
 pub mod throttler;
 pub mod token_bucket;
+pub mod metrics;
 
 pub use config::Config;
-pub use error::{Error, Result};
-pub use response::ApiResponse;
-pub use server::create_app;
+pub use error::{ThrottlerError, Result};
+pub use rate_limiter::RateLimiter;
+pub use redis::RedisClient;
+pub use response::{ApiResponse, ThrottleResponse};
+pub use server::Server;
+pub use throttler::Throttler;
+pub use token_bucket::TokenBucket;
+pub use metrics::{MetricsCollector, ThrottleMetrics, ClientMetrics};
