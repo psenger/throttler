@@ -1,210 +1,127 @@
 use crate::error::ThrottlerError;
+use crate::rate_limiter::RateLimiter;
 use crate::redis::RedisClient;
+use crate::token_bucket::TokenBucket;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
-pub struct ThrottleConfig {
-    pub max_requests: u32,
-    pub window_duration: Duration,
-    pub burst_allowance: u32,
-}
-
-impl Default for ThrottleConfig {
-    fn default() -> Self {
-        Self {
-            max_requests: 100,
-            window_duration: Duration::from_secs(60),
-            burst_allowance: 10,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ThrottleEntry {
-    count: u32,
-    window_start: u64,
-    last_refill: u64,
-    tokens: u32,
-}
-
-pub struct DistributedThrottler {
+/// Core throttling service that manages rate limiting across different clients
+#[derive(Clone)]
+pub struct ThrottlerService {
     redis_client: Arc<RedisClient>,
-    local_cache: Arc<RwLock<HashMap<String, ThrottleEntry>>>,
-    config: ThrottleConfig,
+    local_buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
+    fallback_mode: Arc<Mutex<bool>>,
+    last_redis_check: Arc<Mutex<Instant>>,
 }
 
-impl DistributedThrottler {
-    pub fn new(redis_client: Arc<RedisClient>, config: ThrottleConfig) -> Self {
+impl ThrottlerService {
+    pub fn new(redis_client: RedisClient) -> Self {
         Self {
-            redis_client,
-            local_cache: Arc::new(RwLock::new(HashMap::new())),
-            config,
+            redis_client: Arc::new(redis_client),
+            local_buckets: Arc::new(Mutex::new(HashMap::new())),
+            fallback_mode: Arc::new(Mutex::new(false)),
+            last_redis_check: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
-    pub async fn check_throttle(&self, key: &str) -> Result<bool, ThrottlerError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ThrottlerError::Internal("System time error".into()))?
-            .as_secs();
+    /// Check if a request should be throttled
+    pub async fn should_throttle(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
+        // Check if we should attempt Redis connection recovery
+        self.check_redis_recovery().await;
 
-        // Try Redis first for distributed state
-        match self.check_redis_throttle(key, now).await {
-            Ok(allowed) => Ok(allowed),
-            Err(_) => {
-                // Fallback to local cache if Redis is unavailable
-                self.check_local_throttle(key, now)
-            }
-        }
-    }
-
-    async fn check_redis_throttle(&self, key: &str, now: u64) -> Result<bool, ThrottlerError> {
-        let redis_key = format!("throttle:{}", key);
-        let window_size = self.config.window_duration.as_secs();
-        let window_start = (now / window_size) * window_size;
-
-        // Lua script for atomic Redis operations
-        let lua_script = format!(
-            r#"
-            local key = KEYS[1]
-            local now = tonumber(ARGV[1])
-            local window_start = tonumber(ARGV[2])
-            local max_requests = tonumber(ARGV[3])
-            local burst_allowance = tonumber(ARGV[4])
-            
-            local current = redis.call('HMGET', key, 'count', 'window_start', 'tokens', 'last_refill')
-            local count = tonumber(current[1]) or 0
-            local stored_window = tonumber(current[2]) or window_start
-            local tokens = tonumber(current[3]) or burst_allowance
-            local last_refill = tonumber(current[4]) or now
-            
-            -- Reset if new window
-            if stored_window < window_start then
-                count = 0
-                stored_window = window_start
-            end
-            
-            -- Refill tokens based on time passed
-            local time_passed = now - last_refill
-            local refill_rate = max_requests / 60  -- tokens per second
-            tokens = math.min(burst_allowance, tokens + (time_passed * refill_rate))
-            
-            if tokens >= 1 and count < max_requests then
-                count = count + 1
-                tokens = tokens - 1
-                redis.call('HMSET', key, 'count', count, 'window_start', stored_window, 'tokens', tokens, 'last_refill', now)
-                redis.call('EXPIRE', key, 300)  -- 5 minute expiry
-                return 1
-            else
-                redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
-                return 0
-            end
-            "#
-        );
-
-        let result: i32 = self.redis_client.eval_script(
-            &lua_script,
-            vec![redis_key.as_str()],
-            vec![
-                &now.to_string(),
-                &window_start.to_string(),
-                &self.config.max_requests.to_string(),
-                &self.config.burst_allowance.to_string(),
-            ],
-        ).await?;
-
-        Ok(result == 1)
-    }
-
-    fn check_local_throttle(&self, key: &str, now: u64) -> Result<bool, ThrottlerError> {
-        let mut cache = self.local_cache.write().map_err(|_| {
-            ThrottlerError::Internal("Failed to acquire cache lock".into())
-        })?;
-
-        let window_size = self.config.window_duration.as_secs();
-        let window_start = (now / window_size) * window_size;
-
-        let entry = cache.entry(key.to_string()).or_insert_with(|| ThrottleEntry {
-            count: 0,
-            window_start,
-            last_refill: now,
-            tokens: self.config.burst_allowance,
-        });
-
-        // Reset if new window
-        if entry.window_start < window_start {
-            entry.count = 0;
-            entry.window_start = window_start;
-        }
-
-        // Refill tokens
-        let time_passed = now - entry.last_refill;
-        let refill_rate = self.config.max_requests as f64 / 60.0;
-        entry.tokens = (self.config.burst_allowance as f64)
-            .min(entry.tokens as f64 + (time_passed as f64 * refill_rate)) as u32;
-        entry.last_refill = now;
-
-        if entry.tokens > 0 && entry.count < self.config.max_requests {
-            entry.count += 1;
-            entry.tokens -= 1;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub async fn get_throttle_info(&self, key: &str) -> Result<ThrottleInfo, ThrottlerError> {
-        let redis_key = format!("throttle:{}", key);
+        let is_fallback = *self.fallback_mode.lock().unwrap();
         
-        match self.redis_client.hmget(&redis_key, &["count", "tokens"]).await {
-            Ok(values) => {
-                let count: u32 = values.get(0)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                let tokens: u32 = values.get(1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(self.config.burst_allowance);
-                
-                Ok(ThrottleInfo {
-                    current_count: count,
-                    max_requests: self.config.max_requests,
-                    remaining_tokens: tokens,
-                    window_duration: self.config.window_duration,
-                })
-            }
-            Err(_) => {
-                // Fallback to local cache
-                let cache = self.local_cache.read().map_err(|_| {
-                    ThrottlerError::Internal("Failed to acquire cache lock".into())
-                })?;
-                
-                if let Some(entry) = cache.get(key) {
-                    Ok(ThrottleInfo {
-                        current_count: entry.count,
-                        max_requests: self.config.max_requests,
-                        remaining_tokens: entry.tokens,
-                        window_duration: self.config.window_duration,
-                    })
-                } else {
-                    Ok(ThrottleInfo {
-                        current_count: 0,
-                        max_requests: self.config.max_requests,
-                        remaining_tokens: self.config.burst_allowance,
-                        window_duration: self.config.window_duration,
-                    })
+        if is_fallback {
+            self.throttle_local(client_id, limit, window_secs)
+        } else {
+            match self.throttle_redis(client_id, limit, window_secs).await {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    // Redis failed, switch to fallback mode
+                    *self.fallback_mode.lock().unwrap() = true;
+                    log::warn!("Redis connection failed, switching to local fallback mode for client: {}", client_id);
+                    self.throttle_local(client_id, limit, window_secs)
                 }
             }
         }
     }
+
+    /// Throttle using Redis backend
+    async fn throttle_redis(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
+        let key = format!("throttle:{}", client_id);
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let window_start = current_time - (current_time % window_secs);
+        let redis_key = format!("{}:{}", key, window_start);
+        
+        match self.redis_client.incr_with_expiry(&redis_key, window_secs).await {
+            Ok(count) => Ok(count > limit),
+            Err(e) => {
+                log::error!("Redis throttle check failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Throttle using local token buckets as fallback
+    fn throttle_local(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
+        let mut buckets = self.local_buckets.lock().unwrap();
+        
+        let bucket = buckets.entry(client_id.to_string())
+            .or_insert_with(|| TokenBucket::new(limit, Duration::from_secs(window_secs)));
+        
+        Ok(!bucket.try_consume())
+    }
+
+    /// Periodically check if Redis connection can be restored
+    async fn check_redis_recovery(&self) {
+        let mut last_check = self.last_redis_check.lock().unwrap();
+        let now = Instant::now();
+        
+        // Check every 30 seconds
+        if now.duration_since(*last_check) > Duration::from_secs(30) {
+            *last_check = now;
+            drop(last_check);
+            
+            if *self.fallback_mode.lock().unwrap() {
+                // Try to ping Redis
+                match self.redis_client.ping().await {
+                    Ok(_) => {
+                        *self.fallback_mode.lock().unwrap() = false;
+                        log::info!("Redis connection restored, switching back from fallback mode");
+                    }
+                    Err(_) => {
+                        log::debug!("Redis still unavailable, continuing in fallback mode");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get current service status
+    pub fn get_status(&self) -> ServiceStatus {
+        let is_fallback = *self.fallback_mode.lock().unwrap();
+        let local_client_count = self.local_buckets.lock().unwrap().len();
+        
+        ServiceStatus {
+            fallback_mode: is_fallback,
+            local_clients: local_client_count,
+        }
+    }
+
+    /// Clean up expired local buckets
+    pub fn cleanup_expired_buckets(&self) {
+        let mut buckets = self.local_buckets.lock().unwrap();
+        buckets.retain(|_, bucket| !bucket.is_expired());
+    }
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct ThrottleInfo {
-    pub current_count: u32,
-    pub max_requests: u32,
-    pub remaining_tokens: u32,
-    pub window_duration: Duration,
+#[derive(Debug)]
+pub struct ServiceStatus {
+    pub fallback_mode: bool,
+    pub local_clients: usize,
 }
