@@ -1,138 +1,147 @@
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::Json,
-};
+use crate::error::{ThrottlerError, ThrottlerResult};
+use crate::redis::RedisClient;
+use crate::response::ApiResponse;
+use crate::throttler::Throttler;
+use crate::validation::validate_rate_limit_request;
+use axum::{extract::Path, extract::State, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-use crate::{
-    response::{ApiResponse, ThrottleResponse},
-    throttler::Throttler,
-    Result,
-};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
-pub struct CheckRequest {
-    pub client_id: String,
-    pub tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConfigRequest {
-    pub rate: f64,
-    pub capacity: u32,
-    pub window_seconds: Option<u64>,
+pub struct CreateRateLimitRequest {
+    pub key: String,
+    pub limit: u64,
+    pub window_seconds: u64,
+    pub burst_capacity: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct StatusResponse {
-    pub service: String,
-    pub version: String,
+pub struct RateLimitInfo {
+    pub key: String,
+    pub limit: u64,
+    pub window_seconds: u64,
+    pub remaining: u64,
+    pub reset_time: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthStatus {
     pub status: String,
+    pub version: String,
+    pub redis_connected: bool,
     pub uptime_seconds: u64,
 }
 
-pub async fn health_check() -> Result<Json<ApiResponse<String>>> {
-    Ok(Json(ApiResponse::success("healthy".to_string())))
+static START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn init_start_time() {
+    START_TIME.set(std::time::Instant::now()).ok();
 }
 
-pub async fn get_status(
-    State(throttler): State<Throttler>,
-) -> Result<Json<ApiResponse<StatusResponse>>> {
-    let status = StatusResponse {
-        service: "throttler".to_string(),
+pub async fn health_check(
+    State(redis_client): State<Arc<RedisClient>>,
+) -> ThrottlerResult<Json<ApiResponse<HealthStatus>>> {
+    let start_time = START_TIME.get().copied().unwrap_or_else(std::time::Instant::now);
+    let uptime = start_time.elapsed().as_secs();
+    
+    let redis_connected = match redis_client.ping().await {
+        Ok(_) => true,
+        Err(_) => false,
+    };
+
+    let health = HealthStatus {
+        status: if redis_connected { "healthy".to_string() } else { "degraded".to_string() },
         version: env!("CARGO_PKG_VERSION").to_string(),
-        status: "running".to_string(),
-        uptime_seconds: throttler.get_uptime().await,
+        redis_connected,
+        uptime_seconds: uptime,
     };
-    
-    Ok(Json(ApiResponse::success(status)))
+
+    Ok(Json(ApiResponse::success(health)))
 }
 
-pub async fn check_rate_limit(
-    State(throttler): State<Throttler>,
-    Query(params): Query<CheckRequest>,
-) -> Result<Json<ApiResponse<ThrottleResponse>>> {
-    let tokens = params.tokens.unwrap_or(1);
-    let response = throttler.check_limit(&params.client_id, tokens).await?;
-    
-    let status = if response.allowed {
-        StatusCode::OK
-    } else {
-        StatusCode::TOO_MANY_REQUESTS
-    };
-    
-    Ok(Json(ApiResponse::success(response)))
-}
+pub async fn create_rate_limit(
+    State(throttler): State<Arc<Throttler>>,
+    Json(request): Json<CreateRateLimitRequest>,
+) -> ThrottlerResult<Json<ApiResponse<RateLimitInfo>>> {
+    validate_rate_limit_request(&request)?;
 
-pub async fn configure_client(
-    State(throttler): State<Throttler>,
-    Path(client_id): Path<String>,
-    Json(config): Json<ConfigRequest>,
-) -> Result<Json<ApiResponse<String>>> {
+    let bucket_capacity = request.burst_capacity.unwrap_or(request.limit);
+    
     throttler
-        .configure_client(
-            &client_id,
-            config.rate,
-            config.capacity,
-            config.window_seconds,
+        .create_rate_limit(
+            &request.key,
+            request.limit,
+            request.window_seconds,
+            bucket_capacity,
         )
         .await?;
-    
-    Ok(Json(ApiResponse::success(format!(
-        "Client {} configured successfully",
-        client_id
-    ))))
-}
 
-pub async fn get_client_info(
-    State(throttler): State<Throttler>,
-    Path(client_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>> {
-    let info = throttler.get_client_info(&client_id).await?;
+    let info = RateLimitInfo {
+        key: request.key,
+        limit: request.limit,
+        window_seconds: request.window_seconds,
+        remaining: bucket_capacity,
+        reset_time: chrono::Utc::now().timestamp() as u64 + request.window_seconds,
+    };
+
     Ok(Json(ApiResponse::success(info)))
 }
 
-pub async fn reset_client(
-    State(throttler): State<Throttler>,
-    Path(client_id): Path<String>,
-) -> Result<Json<ApiResponse<String>>> {
-    throttler.reset_client(&client_id).await?;
-    Ok(Json(ApiResponse::success(format!(
-        "Client {} reset successfully",
-        client_id
-    ))))
-}
-
-pub async fn get_metrics(
-    State(throttler): State<Throttler>,
-) -> Result<Json<ApiResponse<HashMap<String, crate::metrics::ThrottleMetrics>>>> {
-    let metrics = throttler.get_all_metrics().await;
-    Ok(Json(ApiResponse::success(metrics)))
-}
-
-pub async fn get_client_metrics(
-    State(throttler): State<Throttler>,
-    Path(client_id): Path<String>,
-) -> Result<Json<ApiResponse<crate::metrics::ThrottleMetrics>>> {
-    let metrics = throttler.get_client_metrics(&client_id).await;
-    match metrics {
-        Some(metrics) => Ok(Json(ApiResponse::success(metrics))),
-        None => Ok(Json(ApiResponse::error(
-            "Client not found".to_string(),
-            Some("NO_METRICS".to_string()),
-        ))),
+pub async fn check_rate_limit(
+    State(throttler): State<Arc<Throttler>>,
+    Path(key): Path<String>,
+) -> ThrottlerResult<Json<ApiResponse<RateLimitInfo>>> {
+    if key.is_empty() {
+        return Err(ThrottlerError::InvalidRequest(
+            "Rate limit key cannot be empty".to_string(),
+        ));
     }
+
+    let (allowed, remaining, reset_time) = throttler.check_rate_limit(&key, 1).await?;
+
+    if !allowed {
+        return Err(ThrottlerError::RateLimitExceeded(format!(
+            "Rate limit exceeded for key: {}",
+            key
+        )));
+    }
+
+    // Get rate limit configuration for this key
+    let config = throttler.get_rate_limit_config(&key).await?;
+
+    let info = RateLimitInfo {
+        key,
+        limit: config.limit,
+        window_seconds: config.window_seconds,
+        remaining,
+        reset_time,
+    };
+
+    Ok(Json(ApiResponse::success(info)))
 }
 
-pub async fn reset_client_metrics(
-    State(throttler): State<Throttler>,
-    Path(client_id): Path<String>,
-) -> Result<Json<ApiResponse<String>>> {
-    throttler.reset_client_metrics(&client_id).await;
-    Ok(Json(ApiResponse::success(format!(
-        "Metrics for client {} reset successfully",
-        client_id
-    ))))
+pub async fn delete_rate_limit(
+    State(throttler): State<Arc<Throttler>>,
+    Path(key): Path<String>,
+) -> ThrottlerResult<Json<ApiResponse<HashMap<String, String>>>> {
+    if key.is_empty() {
+        return Err(ThrottlerError::InvalidRequest(
+            "Rate limit key cannot be empty".to_string(),
+        ));
+    }
+
+    throttler.delete_rate_limit(&key).await?;
+
+    let mut response = HashMap::new();
+    response.insert("message".to_string(), format!("Rate limit for key '{}' deleted successfully", key));
+
+    Ok(Json(ApiResponse::success(response)))
+}
+
+pub async fn list_rate_limits(
+    State(throttler): State<Arc<Throttler>>,
+) -> ThrottlerResult<Json<ApiResponse<Vec<String>>>> {
+    let keys = throttler.list_rate_limit_keys().await?;
+    Ok(Json(ApiResponse::success(keys)))
 }

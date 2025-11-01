@@ -1,125 +1,197 @@
-use crate::error::ThrottlerError;
-use redis::{Client, Commands, Connection};
-use std::sync::{Arc, Mutex};
+use crate::error::{ThrottlerError, ThrottlerResult};
+use redis::{aio::Connection, AsyncCommands, Client, RedisError};
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
 
-/// Redis client wrapper with connection pooling and error handling
 #[derive(Clone)]
 pub struct RedisClient {
     client: Client,
-    connection: Arc<Mutex<Option<Connection>>>,
+    connection_timeout: Duration,
 }
 
 impl RedisClient {
-    pub fn new(redis_url: &str) -> Result<Self, ThrottlerError> {
+    pub fn new(redis_url: &str) -> ThrottlerResult<Self> {
         let client = Client::open(redis_url)
-            .map_err(|e| ThrottlerError::Redis(format!("Failed to create Redis client: {}", e)))?;
+            .map_err(|e| ThrottlerError::RedisConnection(format!("Failed to create Redis client: {}", e)))?;
+
+        info!("Redis client created with URL: {}", redis_url);
         
         Ok(Self {
             client,
-            connection: Arc::new(Mutex::new(None)),
+            connection_timeout: Duration::from_secs(5),
         })
     }
 
-    /// Get or create a Redis connection with timeout
-    async fn get_connection(&self) -> Result<Connection, ThrottlerError> {
-        let timeout_duration = Duration::from_secs(2);
-        
-        timeout(timeout_duration, async {
-            let mut conn_guard = self.connection.lock().unwrap();
-            
-            // Check if we have a valid connection
-            if let Some(ref mut conn) = *conn_guard {
-                // Test the connection
-                match redis::cmd("PING").query::<String>(conn) {
-                    Ok(_) => return Ok(conn.clone()),
-                    Err(_) => {
-                        // Connection is stale, remove it
-                        *conn_guard = None;
-                    }
-                }
-            }
-            
-            // Create new connection
-            match self.client.get_connection() {
-                Ok(new_conn) => {
-                    *conn_guard = Some(new_conn.clone());
-                    Ok(new_conn)
-                }
-                Err(e) => Err(ThrottlerError::Redis(format!("Failed to connect to Redis: {}", e)))
-            }
-        })
-        .await
-        .map_err(|_| ThrottlerError::Redis("Redis connection timeout".to_string()))?
+    async fn get_connection(&self) -> ThrottlerResult<Connection> {
+        timeout(self.connection_timeout, self.client.get_async_connection())
+            .await
+            .map_err(|_| ThrottlerError::RedisConnection("Connection timeout".to_string()))?
+            .map_err(|e| ThrottlerError::RedisConnection(format!("Failed to get connection: {}", e)))
     }
 
-    /// Increment a key with expiry, return current count
-    pub async fn incr_with_expiry(&self, key: &str, expiry_secs: u64) -> Result<u64, ThrottlerError> {
+    pub async fn ping(&self) -> ThrottlerResult<()> {
         let mut conn = self.get_connection().await?;
+        let response: String = conn
+            .ping()
+            .await
+            .map_err(|e| ThrottlerError::RedisConnection(format!("Ping failed: {}", e)))?;
         
-        // Use Redis transaction to ensure atomicity
-        let result: Result<(u64,), redis::RedisError> = redis::transaction(&mut conn, &[key], |conn, pipe| {
-            let current_count: u64 = conn.get(key).unwrap_or(0);
-            
-            if current_count == 0 {
-                // First request, set with expiry
-                pipe.set_ex(key, 1u64, expiry_secs as usize)
-                    .ignore()
-                    .get(key)
-            } else {
-                // Increment existing key
-                pipe.incr(key, 1u64)
-            }
-        });
-        
+        if response == "PONG" {
+            debug!("Redis ping successful");
+            Ok(())
+        } else {
+            Err(ThrottlerError::RedisConnection(
+                "Unexpected ping response".to_string(),
+            ))
+        }
+    }
+
+    pub async fn get_token_count(&self, key: &str) -> ThrottlerResult<Option<f64>> {
+        let mut conn = self.get_connection().await?;
+        let result: Option<String> = conn
+            .hget(key, "tokens")
+            .await
+            .map_err(|e| self.handle_redis_error(e, "get_token_count"))?;
+
         match result {
-            Ok((count,)) => Ok(count),
-            Err(e) => {
-                // Clear connection on error
-                *self.connection.lock().unwrap() = None;
-                Err(ThrottlerError::Redis(format!("Redis operation failed: {}", e)))
+            Some(value) => {
+                let tokens = value.parse::<f64>()
+                    .map_err(|_| ThrottlerError::RedisConnection(
+                        "Invalid token count format in Redis".to_string()
+                    ))?;
+                debug!("Retrieved token count for key {}: {}", key, tokens);
+                Ok(Some(tokens))
+            }
+            None => {
+                debug!("No token count found for key: {}", key);
+                Ok(None)
             }
         }
     }
 
-    /// Ping Redis to check connection
-    pub async fn ping(&self) -> Result<(), ThrottlerError> {
+    pub async fn set_token_bucket(
+        &self,
+        key: &str,
+        tokens: f64,
+        last_refill: u64,
+        limit: u64,
+        refill_rate: f64,
+        capacity: u64,
+    ) -> ThrottlerResult<()> {
         let mut conn = self.get_connection().await?;
         
-        match redis::cmd("PING").query::<String>(&mut conn) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                *self.connection.lock().unwrap() = None;
-                Err(ThrottlerError::Redis(format!("Redis ping failed: {}", e)))
-            }
-        }
+        let _: () = redis::pipe()
+            .atomic()
+            .hset(key, "tokens", tokens.to_string())
+            .hset(key, "last_refill", last_refill.to_string())
+            .hset(key, "limit", limit.to_string())
+            .hset(key, "refill_rate", refill_rate.to_string())
+            .hset(key, "capacity", capacity.to_string())
+            .expire(key, 3600) // Expire after 1 hour of inactivity
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| self.handle_redis_error(e, "set_token_bucket"))?;
+
+        debug!("Set token bucket for key {}: tokens={}, limit={}", key, tokens, limit);
+        Ok(())
     }
 
-    /// Get current count for a key
-    pub async fn get_count(&self, key: &str) -> Result<u64, ThrottlerError> {
+    pub async fn get_token_bucket(&self, key: &str) -> ThrottlerResult<Option<TokenBucketData>> {
         let mut conn = self.get_connection().await?;
         
-        match conn.get(key) {
-            Ok(count) => Ok(count),
-            Err(redis::RedisError { kind: redis::ErrorKind::TypeError, .. }) => Ok(0),
-            Err(e) => {
-                *self.connection.lock().unwrap() = None;
-                Err(ThrottlerError::Redis(format!("Failed to get count: {}", e)))
-            }
+        let result: Vec<Option<String>> = conn
+            .hmget(key, &["tokens", "last_refill", "limit", "refill_rate", "capacity"])
+            .await
+            .map_err(|e| self.handle_redis_error(e, "get_token_bucket"))?;
+
+        if result.iter().all(|x| x.is_none()) {
+            debug!("No token bucket data found for key: {}", key);
+            return Ok(None);
         }
+
+        let tokens = result[0].as_ref()
+            .ok_or_else(|| ThrottlerError::RedisConnection("Missing tokens field".to_string()))?
+            .parse::<f64>()
+            .map_err(|_| ThrottlerError::RedisConnection("Invalid tokens format".to_string()))?;
+
+        let last_refill = result[1].as_ref()
+            .ok_or_else(|| ThrottlerError::RedisConnection("Missing last_refill field".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| ThrottlerError::RedisConnection("Invalid last_refill format".to_string()))?;
+
+        let limit = result[2].as_ref()
+            .ok_or_else(|| ThrottlerError::RedisConnection("Missing limit field".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| ThrottlerError::RedisConnection("Invalid limit format".to_string()))?;
+
+        let refill_rate = result[3].as_ref()
+            .ok_or_else(|| ThrottlerError::RedisConnection("Missing refill_rate field".to_string()))?
+            .parse::<f64>()
+            .map_err(|_| ThrottlerError::RedisConnection("Invalid refill_rate format".to_string()))?;
+
+        let capacity = result[4].as_ref()
+            .ok_or_else(|| ThrottlerError::RedisConnection("Missing capacity field".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| ThrottlerError::RedisConnection("Invalid capacity format".to_string()))?;
+
+        debug!("Retrieved token bucket for key {}: tokens={}, limit={}", key, tokens, limit);
+
+        Ok(Some(TokenBucketData {
+            tokens,
+            last_refill,
+            limit,
+            refill_rate,
+            capacity,
+        }))
     }
 
-    /// Delete a key
-    pub async fn delete(&self, key: &str) -> Result<(), ThrottlerError> {
+    pub async fn delete_key(&self, key: &str) -> ThrottlerResult<bool> {
         let mut conn = self.get_connection().await?;
+        let deleted: u64 = conn
+            .del(key)
+            .await
+            .map_err(|e| self.handle_redis_error(e, "delete_key"))?;
         
-        match conn.del(key) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                *self.connection.lock().unwrap() = None;
-                Err(ThrottlerError::Redis(format!("Failed to delete key: {}", e)))
+        let was_deleted = deleted > 0;
+        debug!("Delete key {}: success={}", key, was_deleted);
+        Ok(was_deleted)
+    }
+
+    pub async fn list_keys(&self, pattern: &str) -> ThrottlerResult<Vec<String>> {
+        let mut conn = self.get_connection().await?;
+        let keys: Vec<String> = conn
+            .keys(pattern)
+            .await
+            .map_err(|e| self.handle_redis_error(e, "list_keys"))?;
+        
+        debug!("Listed {} keys matching pattern: {}", keys.len(), pattern);
+        Ok(keys)
+    }
+
+    fn handle_redis_error(&self, error: RedisError, operation: &str) -> ThrottlerError {
+        match error.kind() {
+            redis::ErrorKind::IoError => {
+                warn!("Redis IO error during {}: {}", operation, error);
+                ThrottlerError::RedisConnection(format!("Connection lost during {}", operation))
+            }
+            redis::ErrorKind::AuthenticationFailed => {
+                error!("Redis authentication failed during {}: {}", operation, error);
+                ThrottlerError::RedisConnection("Authentication failed".to_string())
+            }
+            _ => {
+                error!("Redis error during {}: {}", operation, error);
+                ThrottlerError::RedisConnection(format!("Redis error: {}", error))
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenBucketData {
+    pub tokens: f64,
+    pub last_refill: u64,
+    pub limit: u64,
+    pub refill_rate: f64,
+    pub capacity: u64,
 }
