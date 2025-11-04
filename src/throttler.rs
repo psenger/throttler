@@ -1,127 +1,145 @@
-use crate::error::ThrottlerError;
+use crate::error::{ThrottlerError, ThrottlerResult};
+use crate::rate_limit_config::{RateLimitConfig, RateLimitRule};
 use crate::rate_limiter::RateLimiter;
 use crate::redis::RedisClient;
-use crate::token_bucket::TokenBucket;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-/// Core throttling service that manages rate limiting across different clients
-#[derive(Clone)]
-pub struct ThrottlerService {
-    redis_client: Arc<RedisClient>,
-    local_buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
-    fallback_mode: Arc<Mutex<bool>>,
-    last_redis_check: Arc<Mutex<Instant>>,
+/// Main throttler service that manages rate limiting
+pub struct Throttler {
+    rate_limiter: Arc<RateLimiter>,
+    config: Arc<RwLock<RateLimitConfig>>,
+    redis_client: Option<Arc<RedisClient>>,
 }
 
-impl ThrottlerService {
-    pub fn new(redis_client: RedisClient) -> Self {
-        Self {
-            redis_client: Arc::new(redis_client),
-            local_buckets: Arc::new(Mutex::new(HashMap::new())),
-            fallback_mode: Arc::new(Mutex::new(false)),
-            last_redis_check: Arc::new(Mutex::new(Instant::now())),
-        }
+impl Throttler {
+    /// Create a new throttler instance
+    pub async fn new(
+        config: RateLimitConfig,
+        redis_url: Option<String>,
+    ) -> ThrottlerResult<Self> {
+        let redis_client = if let Some(url) = redis_url {
+            Some(Arc::new(RedisClient::new(&url).await?))
+        } else {
+            None
+        };
+
+        let rate_limiter = Arc::new(RateLimiter::new(redis_client.clone()).await?);
+        
+        Ok(Self {
+            rate_limiter,
+            config: Arc::new(RwLock::new(config)),
+            redis_client,
+        })
     }
 
     /// Check if a request should be throttled
-    pub async fn should_throttle(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
-        // Check if we should attempt Redis connection recovery
-        self.check_redis_recovery().await;
-
-        let is_fallback = *self.fallback_mode.lock().unwrap();
+    pub async fn should_throttle(&self, key: &str) -> ThrottlerResult<bool> {
+        let config = self.config.read().await;
+        let rule = config.get_rule(key);
         
-        if is_fallback {
-            self.throttle_local(client_id, limit, window_secs)
+        if !rule.enabled {
+            return Ok(false);
+        }
+
+        self.rate_limiter
+            .check_rate_limit(key, rule.requests_per_second, rule.burst_capacity)
+            .await
+    }
+
+    /// Get current rate limit status for a key
+    pub async fn get_rate_limit_status(
+        &self,
+        key: &str,
+    ) -> ThrottlerResult<RateLimitStatus> {
+        let config = self.config.read().await;
+        let rule = config.get_rule(key);
+        
+        let remaining = self.rate_limiter.get_remaining_tokens(key).await?;
+        
+        Ok(RateLimitStatus {
+            key: key.to_string(),
+            limit: rule.requests_per_second,
+            remaining,
+            reset_time: self.rate_limiter.get_reset_time(key).await?,
+            enabled: rule.enabled,
+        })
+    }
+
+    /// Update rate limit configuration
+    pub async fn update_config(&self, new_config: RateLimitConfig) -> ThrottlerResult<()> {
+        let mut config = self.config.write().await;
+        *config = new_config;
+        Ok(())
+    }
+
+    /// Add or update a specific rate limit rule
+    pub async fn set_rule(&self, key: String, rule: RateLimitRule) -> ThrottlerResult<()> {
+        rule.validate().map_err(ThrottlerError::ValidationError)?;
+        
+        let mut config = self.config.write().await;
+        config.set_rule(key, rule);
+        Ok(())
+    }
+
+    /// Remove a rate limit rule
+    pub async fn remove_rule(&self, key: &str) -> ThrottlerResult<Option<RateLimitRule>> {
+        let mut config = self.config.write().await;
+        Ok(config.remove_rule(key))
+    }
+
+    /// Get all configured rules
+    pub async fn get_all_rules(&self) -> ThrottlerResult<HashMap<String, RateLimitRule>> {
+        let config = self.config.read().await;
+        Ok(config.rules.clone())
+    }
+
+    /// Reset rate limit for a specific key
+    pub async fn reset_rate_limit(&self, key: &str) -> ThrottlerResult<()> {
+        self.rate_limiter.reset_rate_limit(key).await
+    }
+
+    /// Get throttler health status
+    pub async fn health_check(&self) -> ThrottlerResult<HealthStatus> {
+        let redis_healthy = if let Some(ref client) = self.redis_client {
+            client.ping().await.is_ok()
         } else {
-            match self.throttle_redis(client_id, limit, window_secs).await {
-                Ok(result) => Ok(result),
-                Err(_) => {
-                    // Redis failed, switch to fallback mode
-                    *self.fallback_mode.lock().unwrap() = true;
-                    log::warn!("Redis connection failed, switching to local fallback mode for client: {}", client_id);
-                    self.throttle_local(client_id, limit, window_secs)
-                }
-            }
-        }
-    }
+            true // In-memory mode is always healthy
+        };
 
-    /// Throttle using Redis backend
-    async fn throttle_redis(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
-        let key = format!("throttle:{}", client_id);
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        let window_start = current_time - (current_time % window_secs);
-        let redis_key = format!("{}:{}", key, window_start);
-        
-        match self.redis_client.incr_with_expiry(&redis_key, window_secs).await {
-            Ok(count) => Ok(count > limit),
-            Err(e) => {
-                log::error!("Redis throttle check failed: {}", e);
-                Err(e)
-            }
-        }
-    }
+        let config = self.config.read().await;
+        let total_rules = config.rules.len();
+        let enabled_rules = config
+            .rules
+            .values()
+            .filter(|rule| rule.enabled)
+            .count();
 
-    /// Throttle using local token buckets as fallback
-    fn throttle_local(&self, client_id: &str, limit: u64, window_secs: u64) -> Result<bool, ThrottlerError> {
-        let mut buckets = self.local_buckets.lock().unwrap();
-        
-        let bucket = buckets.entry(client_id.to_string())
-            .or_insert_with(|| TokenBucket::new(limit, Duration::from_secs(window_secs)));
-        
-        Ok(!bucket.try_consume())
-    }
-
-    /// Periodically check if Redis connection can be restored
-    async fn check_redis_recovery(&self) {
-        let mut last_check = self.last_redis_check.lock().unwrap();
-        let now = Instant::now();
-        
-        // Check every 30 seconds
-        if now.duration_since(*last_check) > Duration::from_secs(30) {
-            *last_check = now;
-            drop(last_check);
-            
-            if *self.fallback_mode.lock().unwrap() {
-                // Try to ping Redis
-                match self.redis_client.ping().await {
-                    Ok(_) => {
-                        *self.fallback_mode.lock().unwrap() = false;
-                        log::info!("Redis connection restored, switching back from fallback mode");
-                    }
-                    Err(_) => {
-                        log::debug!("Redis still unavailable, continuing in fallback mode");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Get current service status
-    pub fn get_status(&self) -> ServiceStatus {
-        let is_fallback = *self.fallback_mode.lock().unwrap();
-        let local_client_count = self.local_buckets.lock().unwrap().len();
-        
-        ServiceStatus {
-            fallback_mode: is_fallback,
-            local_clients: local_client_count,
-        }
-    }
-
-    /// Clean up expired local buckets
-    pub fn cleanup_expired_buckets(&self) {
-        let mut buckets = self.local_buckets.lock().unwrap();
-        buckets.retain(|_, bucket| !bucket.is_expired());
+        Ok(HealthStatus {
+            healthy: redis_healthy,
+            redis_connected: self.redis_client.is_some() && redis_healthy,
+            total_rules,
+            enabled_rules,
+        })
     }
 }
 
-#[derive(Debug)]
-pub struct ServiceStatus {
-    pub fallback_mode: bool,
-    pub local_clients: usize,
+/// Rate limit status information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RateLimitStatus {
+    pub key: String,
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset_time: u64,
+    pub enabled: bool,
+}
+
+/// Health status information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthStatus {
+    pub healthy: bool,
+    pub redis_connected: bool,
+    pub total_rules: usize,
+    pub enabled_rules: usize,
 }
