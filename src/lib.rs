@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod health;
 pub mod metrics;
 pub mod middleware;
 pub mod rate_limit_config;
@@ -13,11 +14,9 @@ pub mod token_bucket;
 pub mod validation;
 
 pub use config::Config;
-pub use error::{ThrottlerError, ThrottlerResult};
-pub use rate_limit_config::{RateLimitConfig, RateLimitRule, RateLimitStrategy};
+pub use error::AppError;
+pub use health::{HealthChecker, HealthStatus};
 pub use rate_limiter::RateLimiter;
-pub use redis::RedisClient;
-pub use response::ApiResponse;
+pub use redis::RedisPool;
 pub use server::Server;
 pub use throttler::Throttler;
-pub use token_bucket::TokenBucket;

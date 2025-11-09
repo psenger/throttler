@@ -1,159 +1,185 @@
-use crate::error::ThrottlerError;
-use crate::rate_limit_config::RateLimitConfig;
-use crate::response::{ApiResponse, ErrorResponse};
-use crate::throttler::Throttler;
-use crate::validation::validate_rate_limit_config;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::Json;
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::Json,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use uuid::Uuid;
 
-pub type SharedState = Arc<RwLock<HashMap<String, RateLimitConfig>>>;
+use crate::{
+    error::AppError,
+    health::HealthChecker,
+    metrics::MetricsCollector,
+    rate_limit_config::{RateLimitConfig, RateLimitRule},
+    response::ApiResponse,
+    throttler::Throttler,
+    validation::ValidationError,
+};
 
-/// Get rate limit configuration for a specific key
-pub async fn get_rate_limit(
-    Path(key): Path<String>,
-    State(state): State<SharedState>,
-) -> Result<Json<ApiResponse<RateLimitConfig>>, (StatusCode, Json<ErrorResponse>)> {
-    let configs = state.read().await;
-    
-    match configs.get(&key) {
-        Some(config) => Ok(Json(ApiResponse {
-            success: true,
-            data: Some(config.clone()),
-            message: "Rate limit configuration retrieved successfully".to_string(),
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                success: false,
-                error: "Rate limit configuration not found".to_string(),
-                code: "NOT_FOUND".to_string(),
-            }),
-        )),
-    }
+#[derive(Debug, Deserialize)]
+pub struct CheckRateLimitQuery {
+    pub client_id: String,
+    pub endpoint: Option<String>,
 }
 
-/// Set rate limit configuration for a specific key
-pub async fn set_rate_limit(
-    Path(key): Path<String>,
-    State(state): State<SharedState>,
-    Json(config): Json<RateLimitConfig>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ErrorResponse>)> {
-    // Validate the configuration
-    if let Err(validation_error) = validate_rate_limit_config(&config) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                success: false,
-                error: validation_error,
-                code: "VALIDATION_ERROR".to_string(),
-            }),
-        ));
-    }
+#[derive(Debug, Serialize)]
+pub struct RateLimitStatus {
+    pub allowed: bool,
+    pub remaining: u64,
+    pub reset_time: u64,
+    pub retry_after: Option<u64>,
+}
 
-    let mut configs = state.write().await;
-    configs.insert(key, config);
+#[derive(Debug, Clone)]
+pub struct AppState {
+    pub throttler: Throttler,
+    pub health_checker: HealthChecker,
+    pub metrics: MetricsCollector,
+}
+
+pub async fn health_check(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<crate::health::HealthStatus>>, AppError> {
+    let health_status = state.health_checker.check_health().await?;
     
-    Ok(Json(ApiResponse {
+    let response = ApiResponse {
+        success: health_status.status == "healthy",
+        data: Some(health_status),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
+}
+
+pub async fn check_rate_limit(
+    Query(query): Query<CheckRateLimitQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<RateLimitStatus>>, AppError> {
+    let endpoint = query.endpoint.unwrap_or_else(|| "default".to_string());
+    
+    let result = state.throttler.check_rate_limit(
+        &query.client_id,
+        &endpoint,
+    ).await?;
+    
+    state.metrics.record_rate_limit_check(&query.client_id, &endpoint, result.allowed).await;
+    
+    let status = RateLimitStatus {
+        allowed: result.allowed,
+        remaining: result.remaining,
+        reset_time: result.reset_time,
+        retry_after: if result.allowed { None } else { Some(result.retry_after) },
+    };
+    
+    let response = ApiResponse {
+        success: true,
+        data: Some(status),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
+}
+
+pub async fn create_rate_limit_config(
+    State(state): State<AppState>,
+    Json(config): Json<RateLimitConfig>,
+) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
+    // Validate the configuration
+    config.validate().map_err(|e| AppError::Validation(e))?;
+    
+    state.throttler.create_config(config.clone()).await?;
+    
+    let response = ApiResponse {
+        success: true,
+        data: Some(config),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
+}
+
+pub async fn get_rate_limit_config(
+    Path(config_id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
+    let config = state.throttler.get_config(config_id).await?;
+    
+    let response = ApiResponse {
+        success: true,
+        data: Some(config),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
+}
+
+pub async fn update_rate_limit_config(
+    Path(config_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Json(mut config): Json<RateLimitConfig>,
+) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
+    config.id = config_id;
+    config.validate().map_err(|e| AppError::Validation(e))?;
+    
+    state.throttler.update_config(config.clone()).await?;
+    
+    let response = ApiResponse {
+        success: true,
+        data: Some(config),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
+}
+
+pub async fn delete_rate_limit_config(
+    Path(config_id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    state.throttler.delete_config(config_id).await?;
+    
+    let response = ApiResponse {
         success: true,
         data: None,
-        message: "Rate limit configuration set successfully".to_string(),
-    }))
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
 }
 
-/// Delete rate limit configuration for a specific key
-pub async fn delete_rate_limit(
-    Path(key): Path<String>,
-    State(state): State<SharedState>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ErrorResponse>)> {
-    let mut configs = state.write().await;
+pub async fn list_rate_limit_configs(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<Vec<RateLimitConfig>>>, AppError> {
+    let configs = state.throttler.list_configs().await?;
     
-    match configs.remove(&key) {
-        Some(_) => Ok(Json(ApiResponse {
-            success: true,
-            data: None,
-            message: "Rate limit configuration deleted successfully".to_string(),
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                success: false,
-                error: "Rate limit configuration not found".to_string(),
-                code: "NOT_FOUND".to_string(),
-            }),
-        )),
-    }
-}
-
-/// Check rate limit for a specific key
-pub async fn check_rate_limit(
-    Path(key): Path<String>,
-    State(state): State<SharedState>,
-) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ErrorResponse>)> {
-    let configs = state.read().await;
-    
-    match configs.get(&key) {
-        Some(config) => {
-            let mut throttler = Throttler::new(config.clone());
-            match throttler.check_rate_limit(&key).await {
-                Ok(allowed) => Ok(Json(ApiResponse {
-                    success: true,
-                    data: Some(allowed),
-                    message: if allowed {
-                        "Request allowed".to_string()
-                    } else {
-                        "Rate limit exceeded".to_string()
-                    },
-                })),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        success: false,
-                        error: e.to_string(),
-                        code: "THROTTLER_ERROR".to_string(),
-                    }),
-                )),
-            }
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                success: false,
-                error: "Rate limit configuration not found".to_string(),
-                code: "NOT_FOUND".to_string(),
-            }),
-        )),
-    }
-}
-
-/// Health check endpoint
-pub async fn health_check() -> Json<ApiResponse<HashMap<String, String>>> {
-    let mut health_info = HashMap::new();
-    health_info.insert("status".to_string(), "healthy".to_string());
-    health_info.insert("service".to_string(), "throttler".to_string());
-    health_info.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-    health_info.insert("uptime".to_string(), "running".to_string());
-    
-    Json(ApiResponse {
+    let response = ApiResponse {
         success: true,
-        data: Some(health_info),
-        message: "Service is healthy".to_string(),
-    })
+        data: Some(configs),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
 }
 
-/// Readiness check endpoint
-pub async fn readiness_check() -> Result<Json<ApiResponse<HashMap<String, String>>>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Add actual readiness checks (Redis connectivity, etc.)
-    let mut readiness_info = HashMap::new();
-    readiness_info.insert("status".to_string(), "ready".to_string());
-    readiness_info.insert("redis".to_string(), "connected".to_string());
+pub async fn get_metrics(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<crate::metrics::MetricsSummary>>, AppError> {
+    let metrics = state.metrics.get_summary().await;
     
-    Ok(Json(ApiResponse {
+    let response = ApiResponse {
         success: true,
-        data: Some(readiness_info),
-        message: "Service is ready".to_string(),
-    }))
+        data: Some(metrics),
+        error: None,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+    };
+    
+    Ok(Json(response))
 }
