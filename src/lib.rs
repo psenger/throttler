@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_validator;
 pub mod error;
 pub mod handlers;
 pub mod health;
@@ -14,9 +15,11 @@ pub mod token_bucket;
 pub mod validation;
 
 pub use config::Config;
-pub use error::AppError;
-pub use health::{HealthChecker, HealthStatus};
+pub use config_validator::ConfigValidator;
+pub use error::ThrottlerError;
+pub use rate_limit_config::RateLimitConfig;
 pub use rate_limiter::RateLimiter;
-pub use redis::RedisPool;
 pub use server::Server;
 pub use throttler::Throttler;
+pub use token_bucket::TokenBucket;
+pub use validation::RequestValidator;
