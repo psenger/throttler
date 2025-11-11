@@ -2,27 +2,38 @@
 name = "throttler"
 version = "0.1.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
 description = "A lightweight Rust web API rate limiting and request throttling service"
 license = "MIT"
-repository = "https://github.com/example/throttler"
+repository = "https://github.com/yourusername/throttler"
 keywords = ["rate-limiting", "throttling", "web", "api", "redis"]
 categories = ["web-programming", "network-programming"]
 
 [dependencies]
-axum = "0.7"
 tokio = { version = "1.0", features = ["full"] }
+axum = { version = "0.7", features = ["tokio"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+redis = { version = "0.24", features = ["tokio-comp"] }
+thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-redis = { version = "0.23", features = ["tokio-comp"] }
-anyhow = "1.0"
-thiserror = "1.0"
 tower = "0.4"
-tower-http = { version = "0.4", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 dotenv = "0.15"
-validator = { version = "0.16", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+config = "0.14"
+validator = { version = "0.18", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4"] }
-prometheus = "0.13"
-lazy_static = "1.4"
+clap = { version = "4.0", features = ["derive"] }
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+tokio-test = "0.4"
+
+[lib]
+name = "throttler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "throttler"
+path = "src/main.rs"
