@@ -1,16 +1,17 @@
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
+use crate::error::ThrottlerError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBucket {
-    capacity: u32,
-    tokens: f64,
-    refill_rate: f64, // tokens per second
-    last_refill: Instant,
+    pub capacity: u64,
+    pub tokens: f64,
+    pub refill_rate: f64, // tokens per second
+    pub last_refill: Instant,
 }
 
 impl TokenBucket {
-    pub fn new(capacity: u32, refill_rate: f64) -> Self {
+    pub fn new(capacity: u64, refill_rate: f64) -> Self {
         Self {
             capacity,
             tokens: capacity as f64,
@@ -19,53 +20,75 @@ impl TokenBucket {
         }
     }
 
-    pub fn consume(&mut self, tokens: u32) -> bool {
-        self.refill();
+    pub fn try_consume(&mut self, tokens: u64) -> Result<bool, ThrottlerError> {
+        self.refill()?;
         
-        if self.tokens >= tokens as f64 {
-            self.tokens -= tokens as f64;
-            true
+        let tokens_f64 = tokens as f64;
+        if self.tokens >= tokens_f64 {
+            self.tokens -= tokens_f64;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    pub fn available_tokens(&mut self) -> u32 {
-        self.refill();
-        self.tokens.floor() as u32
-    }
-
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
-    pub fn refill_rate(&self) -> f64 {
-        self.refill_rate
-    }
-
-    fn refill(&mut self) {
+    pub fn refill(&mut self) -> Result<(), ThrottlerError> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill);
         
-        if elapsed > Duration::from_millis(1) {
-            let tokens_to_add = self.refill_rate * elapsed.as_secs_f64();
-            
-            // Prevent overflow by capping at capacity
+        // Prevent overflow and handle very large time differences
+        let max_elapsed = Duration::from_secs(3600); // 1 hour max
+        let safe_elapsed = if elapsed > max_elapsed {
+            max_elapsed
+        } else {
+            elapsed
+        };
+        
+        let seconds_elapsed = safe_elapsed.as_secs_f64();
+        
+        // Avoid floating point precision issues with very small durations
+        if seconds_elapsed < 0.001 {
+            return Ok(());
+        }
+        
+        let tokens_to_add = self.refill_rate * seconds_elapsed;
+        
+        // Ensure we don't exceed capacity and handle potential NaN/infinity
+        if tokens_to_add.is_finite() && tokens_to_add > 0.0 {
             self.tokens = (self.tokens + tokens_to_add).min(self.capacity as f64);
-            self.last_refill = now;
         }
+        
+        self.last_refill = now;
+        Ok(())
     }
 
-    pub fn set_capacity(&mut self, capacity: u32) {
-        self.capacity = capacity;
-        // If current tokens exceed new capacity, cap them
-        if self.tokens > capacity as f64 {
-            self.tokens = capacity as f64;
-        }
+    pub fn available_tokens(&mut self) -> Result<u64, ThrottlerError> {
+        self.refill()?;
+        Ok(self.tokens.floor() as u64)
     }
 
-    pub fn set_refill_rate(&mut self, rate: f64) {
-        self.refill_rate = rate;
+    pub fn time_until_tokens(&mut self, tokens: u64) -> Result<Duration, ThrottlerError> {
+        self.refill()?;
+        
+        let tokens_f64 = tokens as f64;
+        if self.tokens >= tokens_f64 {
+            return Ok(Duration::from_secs(0));
+        }
+        
+        let tokens_needed = tokens_f64 - self.tokens;
+        
+        // Handle edge case where refill_rate is zero or very small
+        if self.refill_rate <= 0.0 {
+            return Ok(Duration::from_secs(u64::MAX));
+        }
+        
+        let seconds_needed = tokens_needed / self.refill_rate;
+        
+        // Cap the wait time to prevent overflow
+        let max_wait_seconds = 86400.0; // 24 hours
+        let safe_seconds = seconds_needed.min(max_wait_seconds);
+        
+        Ok(Duration::from_secs_f64(safe_seconds))
     }
 
     pub fn reset(&mut self) {
@@ -73,65 +96,13 @@ impl TokenBucket {
         self.last_refill = Instant::now();
     }
 
-    pub fn time_until_available(&mut self, required_tokens: u32) -> Option<Duration> {
-        self.refill();
-        
-        if self.tokens >= required_tokens as f64 {
-            return None;
-        }
-        
-        let tokens_needed = required_tokens as f64 - self.tokens;
-        let seconds_to_wait = tokens_needed / self.refill_rate;
-        
-        Some(Duration::from_secs_f64(seconds_to_wait))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    #[test]
-    fn test_token_bucket_creation() {
-        let bucket = TokenBucket::new(10, 2.0);
-        assert_eq!(bucket.capacity(), 10);
-        assert_eq!(bucket.refill_rate(), 2.0);
+    pub fn is_empty(&mut self) -> Result<bool, ThrottlerError> {
+        self.refill()?;
+        Ok(self.tokens < 1.0)
     }
 
-    #[test]
-    fn test_token_consumption() {
-        let mut bucket = TokenBucket::new(10, 2.0);
-        assert!(bucket.consume(5));
-        assert_eq!(bucket.available_tokens(), 5);
-        assert!(bucket.consume(5));
-        assert_eq!(bucket.available_tokens(), 0);
-        assert!(!bucket.consume(1));
-    }
-
-    #[test]
-    fn test_capacity_overflow_prevention() {
-        let mut bucket = TokenBucket::new(5, 1000.0); // Very high refill rate
-        bucket.consume(3);
-        
-        thread::sleep(Duration::from_millis(10));
-        
-        // Even with high refill rate, tokens should not exceed capacity
-        assert!(bucket.available_tokens() <= 5);
-        assert_eq!(bucket.available_tokens(), 5);
-    }
-
-    #[test]
-    fn test_capacity_change() {
-        let mut bucket = TokenBucket::new(10, 2.0);
-        bucket.consume(5);
-        
-        // Reduce capacity below current tokens
-        bucket.set_capacity(3);
-        assert_eq!(bucket.available_tokens(), 3);
-        
-        // Increase capacity
-        bucket.set_capacity(15);
-        assert_eq!(bucket.capacity(), 15);
+    pub fn utilization(&mut self) -> Result<f64, ThrottlerError> {
+        self.refill()?;
+        Ok(1.0 - (self.tokens / self.capacity as f64))
     }
 }

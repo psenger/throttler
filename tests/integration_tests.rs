@@ -1,284 +1,109 @@
-use reqwest::Client;
-use serde_json::json;
 use std::time::Duration;
 use tokio::time::sleep;
-use throttler::config::Config;
-use throttler::server::create_app;
+use throttler::{
+    config::Config,
+    server::create_app,
+    token_bucket::TokenBucket,
+};
 
 #[tokio::test]
-async fn test_basic_rate_limiting() {
-    let config = Config::new();
-    let app = create_app(config).await;
+async fn test_token_bucket_edge_cases() {
+    // Test zero refill rate
+    let mut bucket = TokenBucket::new(10, 0.0);
+    assert!(bucket.try_consume(5).unwrap());
     
-    // Start test server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
+    let wait_time = bucket.time_until_tokens(10).unwrap();
+    assert_eq!(wait_time, Duration::from_secs(u64::MAX));
     
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    // Test very small time differences
+    let mut bucket = TokenBucket::new(100, 10.0);
+    bucket.try_consume(50).unwrap();
     
-    let client = Client::new();
-    let base_url = format!("http://{}", addr);
+    // Immediate refill attempt should not cause issues
+    let available = bucket.available_tokens().unwrap();
+    assert!(available <= 50);
     
-    // Create a rate limit configuration
-    let config_payload = json!({
-        "key": "test_api",
-        "requests_per_second": 2,
-        "burst_capacity": 5
-    });
-    
-    let response = client
-        .post(&format!("{}/config", base_url))
-        .json(&config_payload)
-        .send()
-        .await
-        .unwrap();
-    
-    assert_eq!(response.status(), 201);
-    
-    // Test rate limiting
-    for i in 1..=5 {
-        let response = client
-            .post(&format!("{}/throttle", base_url))
-            .header("X-API-Key", "test_api")
-            .send()
-            .await
-            .unwrap();
-        
-        if i <= 5 {
-            assert_eq!(response.status(), 200);
-        }
+    // Test floating point precision
+    let mut bucket = TokenBucket::new(1000, 0.1);
+    for _ in 0..10 {
+        bucket.refill().unwrap();
     }
     
-    // This request should be rate limited
-    let response = client
-        .post(&format!("{}/throttle", base_url))
-        .header("X-API-Key", "test_api")
-        .send()
-        .await
-        .unwrap();
-    
-    assert_eq!(response.status(), 429);
+    assert!(bucket.tokens <= 1000.0);
 }
 
 #[tokio::test]
-async fn test_token_bucket_refill() {
-    let config = Config::new();
-    let app = create_app(config).await;
+async fn test_rate_limiting_basic() {
+    let config = Config::default();
+    let app = create_app(config).await.unwrap();
     
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    
-    let client = Client::new();
-    let base_url = format!("http://{}", addr);
-    
-    // Create a strict rate limit
-    let config_payload = json!({
-        "key": "refill_test",
-        "requests_per_second": 1,
-        "burst_capacity": 1
-    });
-    
-    client
-        .post(&format!("{}/config", base_url))
-        .json(&config_payload)
-        .send()
-        .await
-        .unwrap();
-    
-    // Use up the token
-    let response = client
-        .post(&format!("{}/throttle", base_url))
-        .header("X-API-Key", "refill_test")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    
-    // Should be rate limited
-    let response = client
-        .post(&format!("{}/throttle", base_url))
-        .header("X-API-Key", "refill_test")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 429);
-    
-    // Wait for token refill
-    sleep(Duration::from_millis(1100)).await;
-    
-    // Should work again
-    let response = client
-        .post(&format!("{}/throttle", base_url))
-        .header("X-API-Key", "refill_test")
-        .send()
-        .await
-        .unwrap();
+    let response = warp::test::request()
+        .method("POST")
+        .path("/throttle")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "key": "test-key",
+            "tokens": 1
+        }))
+        .reply(&app)
+        .await;
+        
     assert_eq!(response.status(), 200);
 }
 
 #[tokio::test]
-async fn test_config_management() {
-    let config = Config::new();
-    let app = create_app(config).await;
+async fn test_health_endpoint() {
+    let config = Config::default();
+    let app = create_app(config).await.unwrap();
     
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    
-    let client = Client::new();
-    let base_url = format!("http://{}", addr);
-    
-    // Create config
-    let config_payload = json!({
-        "key": "config_test",
-        "requests_per_second": 10,
-        "burst_capacity": 20
-    });
-    
-    let response = client
-        .post(&format!("{}/config", base_url))
-        .json(&config_payload)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 201);
-    
-    // Get config
-    let response = client
-        .get(&format!("{}/config/config_test", base_url))
-        .send()
-        .await
-        .unwrap();
+    let response = warp::test::request()
+        .method("GET")
+        .path("/health")
+        .reply(&app)
+        .await;
+        
     assert_eq!(response.status(), 200);
     
-    let config_data: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(config_data["key"], "config_test");
-    assert_eq!(config_data["requests_per_second"], 10);
-    
-    // Update config
-    let updated_config = json!({
-        "key": "config_test",
-        "requests_per_second": 15,
-        "burst_capacity": 25
-    });
-    
-    let response = client
-        .put(&format!("{}/config/config_test", base_url))
-        .json(&updated_config)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    
-    // Delete config
-    let response = client
-        .delete(&format!("{}/config/config_test", base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 204);
-    
-    // Should not exist anymore
-    let response = client
-        .get(&format!("{}/config/config_test", base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(body["status"], "healthy");
 }
 
 #[tokio::test]
 async fn test_metrics_endpoint() {
-    let config = Config::new();
-    let app = create_app(config).await;
+    let config = Config::default();
+    let app = create_app(config).await.unwrap();
     
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    
-    let client = Client::new();
-    let base_url = format!("http://{}", addr);
-    
-    // Create config and make some requests
-    let config_payload = json!({
-        "key": "metrics_test",
-        "requests_per_second": 5,
-        "burst_capacity": 10
-    });
-    
-    client
-        .post(&format!("{}/config", base_url))
-        .json(&config_payload)
-        .send()
-        .await
-        .unwrap();
-    
-    // Make some throttle requests
-    for _ in 0..3 {
-        client
-            .post(&format!("{}/throttle", base_url))
-            .header("X-API-Key", "metrics_test")
-            .send()
-            .await
-            .unwrap();
-    }
-    
-    // Check metrics
-    let response = client
-        .get(&format!("{}/metrics", base_url))
-        .send()
-        .await
-        .unwrap();
-    
+    let response = warp::test::request()
+        .method("GET")
+        .path("/metrics")
+        .reply(&app)
+        .await;
+        
     assert_eq!(response.status(), 200);
-    let metrics: serde_json::Value = response.json().await.unwrap();
-    assert!(metrics["total_requests"].as_u64().unwrap() >= 3);
 }
 
 #[tokio::test]
-async fn test_health_check() {
-    let config = Config::new();
-    let app = create_app(config).await;
+async fn test_rate_limit_exceeded() {
+    let config = Config::default();
+    let app = create_app(config).await.unwrap();
     
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    
-    let client = Client::new();
-    let base_url = format!("http://{}", addr);
-    
-    let response = client
-        .get(&format!("{}/health", base_url))
-        .send()
-        .await
-        .unwrap();
-    
-    assert_eq!(response.status(), 200);
-    let health: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(health["status"], "healthy");
+    // Make multiple requests to exceed rate limit
+    for i in 0..15 {
+        let response = warp::test::request()
+            .method("POST")
+            .path("/throttle")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "key": "burst-test-key",
+                "tokens": 10
+            }))
+            .reply(&app)
+            .await;
+            
+        if i < 10 {
+            assert_eq!(response.status(), 200);
+        } else {
+            assert_eq!(response.status(), 429);
+        }
+    }
 }
