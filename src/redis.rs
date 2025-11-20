@@ -1,197 +1,205 @@
-use crate::error::{ThrottlerError, ThrottlerResult};
-use redis::{aio::Connection, AsyncCommands, Client, RedisError};
-use std::time::Duration;
-use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use redis::{Client, Commands, Connection, RedisResult};
+use serde_json;
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::error::ThrottlerError;
+use crate::token_bucket::TokenBucket;
 
-#[derive(Clone)]
 pub struct RedisClient {
     client: Client,
-    connection_timeout: Duration,
 }
 
 impl RedisClient {
-    pub fn new(redis_url: &str) -> ThrottlerResult<Self> {
-        let client = Client::open(redis_url)
-            .map_err(|e| ThrottlerError::RedisConnection(format!("Failed to create Redis client: {}", e)))?;
-
-        info!("Redis client created with URL: {}", redis_url);
+    pub fn new(url: &str) -> Result<Self, ThrottlerError> {
+        let client = Client::open(url)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to create Redis client: {}", e)))?;
         
-        Ok(Self {
-            client,
-            connection_timeout: Duration::from_secs(5),
-        })
+        Ok(RedisClient { client })
     }
 
-    async fn get_connection(&self) -> ThrottlerResult<Connection> {
-        timeout(self.connection_timeout, self.client.get_async_connection())
-            .await
-            .map_err(|_| ThrottlerError::RedisConnection("Connection timeout".to_string()))?
-            .map_err(|e| ThrottlerError::RedisConnection(format!("Failed to get connection: {}", e)))
+    pub fn get_connection(&self) -> Result<Connection, ThrottlerError> {
+        self.client.get_connection()
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to get Redis connection: {}", e)))
     }
 
-    pub async fn ping(&self) -> ThrottlerResult<()> {
-        let mut conn = self.get_connection().await?;
-        let response: String = conn
-            .ping()
-            .await
-            .map_err(|e| ThrottlerError::RedisConnection(format!("Ping failed: {}", e)))?;
+    pub fn get_token_bucket(&self, key: &str) -> Result<Option<TokenBucket>, ThrottlerError> {
+        let mut conn = self.get_connection()?;
         
-        if response == "PONG" {
-            debug!("Redis ping successful");
-            Ok(())
-        } else {
-            Err(ThrottlerError::RedisConnection(
-                "Unexpected ping response".to_string(),
-            ))
+        let data: Option<String> = conn.get(key)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to get token bucket: {}", e)))?;
+        
+        match data {
+            Some(json) => {
+                let bucket: TokenBucket = serde_json::from_str(&json)
+                    .map_err(|e| ThrottlerError::Serialization(format!("Failed to deserialize token bucket: {}", e)))?;
+                Ok(Some(bucket))
+            }
+            None => Ok(None)
         }
     }
 
-    pub async fn get_token_count(&self, key: &str) -> ThrottlerResult<Option<f64>> {
-        let mut conn = self.get_connection().await?;
-        let result: Option<String> = conn
-            .hget(key, "tokens")
-            .await
-            .map_err(|e| self.handle_redis_error(e, "get_token_count"))?;
-
-        match result {
-            Some(value) => {
-                let tokens = value.parse::<f64>()
-                    .map_err(|_| ThrottlerError::RedisConnection(
-                        "Invalid token count format in Redis".to_string()
-                    ))?;
-                debug!("Retrieved token count for key {}: {}", key, tokens);
-                Ok(Some(tokens))
-            }
-            None => {
-                debug!("No token count found for key: {}", key);
-                Ok(None)
-            }
-        }
-    }
-
-    pub async fn set_token_bucket(
-        &self,
-        key: &str,
-        tokens: f64,
-        last_refill: u64,
-        limit: u64,
-        refill_rate: f64,
-        capacity: u64,
-    ) -> ThrottlerResult<()> {
-        let mut conn = self.get_connection().await?;
+    pub fn set_token_bucket(&self, key: &str, bucket: &TokenBucket, ttl: usize) -> Result<(), ThrottlerError> {
+        let mut conn = self.get_connection()?;
         
-        let _: () = redis::pipe()
-            .atomic()
-            .hset(key, "tokens", tokens.to_string())
-            .hset(key, "last_refill", last_refill.to_string())
-            .hset(key, "limit", limit.to_string())
-            .hset(key, "refill_rate", refill_rate.to_string())
-            .hset(key, "capacity", capacity.to_string())
-            .expire(key, 3600) // Expire after 1 hour of inactivity
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| self.handle_redis_error(e, "set_token_bucket"))?;
+        let json = serde_json::to_string(bucket)
+            .map_err(|e| ThrottlerError::Serialization(format!("Failed to serialize token bucket: {}", e)))?;
+        
+        // Use Lua script to atomically update the bucket with proper race condition handling
+        let script = r#"
+            local key = KEYS[1]
+            local new_data = ARGV[1]
+            local ttl = tonumber(ARGV[2])
+            local current_time = tonumber(ARGV[3])
+            
+            local existing = redis.call('GET', key)
+            if existing then
+                local existing_bucket = cjson.decode(existing)
+                local new_bucket = cjson.decode(new_data)
+                
+                -- Only update if the new bucket has a more recent last_refill time
+                -- or if the existing bucket is older than expected
+                if new_bucket.last_refill >= existing_bucket.last_refill or 
+                   (current_time - existing_bucket.last_refill) > 1 then
+                    redis.call('SET', key, new_data)
+                    redis.call('EXPIRE', key, ttl)
+                    return 1
+                else
+                    return 0
+                end
+            else
+                redis.call('SET', key, new_data)
+                redis.call('EXPIRE', key, ttl)
+                return 1
+            end
+        "#;
 
-        debug!("Set token bucket for key {}: tokens={}, limit={}", key, tokens, limit);
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result: i32 = redis::Script::new(script)
+            .key(key)
+            .arg(&json)
+            .arg(ttl)
+            .arg(current_time)
+            .invoke(&mut conn)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to execute Redis script: {}", e)))?;
+
+        if result == 0 {
+            return Err(ThrottlerError::Redis("Token bucket update was rejected due to race condition".to_string()));
+        }
+
         Ok(())
     }
 
-    pub async fn get_token_bucket(&self, key: &str) -> ThrottlerResult<Option<TokenBucketData>> {
-        let mut conn = self.get_connection().await?;
+    pub fn delete_token_bucket(&self, key: &str) -> Result<(), ThrottlerError> {
+        let mut conn = self.get_connection()?;
         
-        let result: Vec<Option<String>> = conn
-            .hmget(key, &["tokens", "last_refill", "limit", "refill_rate", "capacity"])
-            .await
-            .map_err(|e| self.handle_redis_error(e, "get_token_bucket"))?;
+        let _: () = conn.del(key)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to delete token bucket: {}", e)))?;
+        
+        Ok(())
+    }
 
-        if result.iter().all(|x| x.is_none()) {
-            debug!("No token bucket data found for key: {}", key);
-            return Ok(None);
+    pub fn exists(&self, key: &str) -> Result<bool, ThrottlerError> {
+        let mut conn = self.get_connection()?;
+        
+        let exists: bool = conn.exists(key)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to check key existence: {}", e)))?;
+        
+        Ok(exists)
+    }
+
+    pub fn ping(&self) -> Result<String, ThrottlerError> {
+        let mut conn = self.get_connection()?;
+        
+        let pong: String = redis::cmd("PING")
+            .query(&mut conn)
+            .map_err(|e| ThrottlerError::Redis(format!("Redis ping failed: {}", e)))?;
+        
+        Ok(pong)
+    }
+
+    pub fn atomic_consume_tokens(&self, key: &str, tokens_to_consume: u32, bucket_config: &crate::rate_limit_config::RateLimitConfig) -> Result<(bool, TokenBucket), ThrottlerError> {
+        let mut conn = self.get_connection()?;
+        
+        let script = r#"
+            local key = KEYS[1]
+            local tokens_to_consume = tonumber(ARGV[1])
+            local capacity = tonumber(ARGV[2])
+            local refill_rate = tonumber(ARGV[3])
+            local window_ms = tonumber(ARGV[4])
+            local current_time = tonumber(ARGV[5])
+            
+            local existing = redis.call('GET', key)
+            local bucket
+            
+            if existing then
+                bucket = cjson.decode(existing)
+                
+                -- Calculate tokens to add based on time elapsed
+                local time_elapsed = current_time - bucket.last_refill
+                if time_elapsed > 0 then
+                    local tokens_to_add = math.floor(time_elapsed * refill_rate / window_ms)
+                    bucket.tokens = math.min(capacity, bucket.tokens + tokens_to_add)
+                    bucket.last_refill = current_time
+                end
+            else
+                bucket = {
+                    tokens = capacity,
+                    capacity = capacity,
+                    refill_rate = refill_rate,
+                    window_ms = window_ms,
+                    last_refill = current_time
+                }
+            end
+            
+            local success = false
+            if bucket.tokens >= tokens_to_consume then
+                bucket.tokens = bucket.tokens - tokens_to_consume
+                success = true
+            end
+            
+            local bucket_json = cjson.encode(bucket)
+            redis.call('SET', key, bucket_json)
+            redis.call('EXPIRE', key, math.ceil(window_ms / 1000))
+            
+            return {success and 1 or 0, bucket_json}
+        "#;
+
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let result: Vec<redis::Value> = redis::Script::new(script)
+            .key(key)
+            .arg(tokens_to_consume)
+            .arg(bucket_config.burst_size)
+            .arg(bucket_config.requests_per_window)
+            .arg(bucket_config.window_ms)
+            .arg(current_time)
+            .invoke(&mut conn)
+            .map_err(|e| ThrottlerError::Redis(format!("Failed to execute atomic consume script: {}", e)))?;
+
+        if result.len() != 2 {
+            return Err(ThrottlerError::Redis("Invalid response from Redis script".to_string()));
         }
 
-        let tokens = result[0].as_ref()
-            .ok_or_else(|| ThrottlerError::RedisConnection("Missing tokens field".to_string()))?
-            .parse::<f64>()
-            .map_err(|_| ThrottlerError::RedisConnection("Invalid tokens format".to_string()))?;
+        let success = match &result[0] {
+            redis::Value::Int(val) => *val == 1,
+            _ => return Err(ThrottlerError::Redis("Invalid success value from Redis".to_string())),
+        };
 
-        let last_refill = result[1].as_ref()
-            .ok_or_else(|| ThrottlerError::RedisConnection("Missing last_refill field".to_string()))?
-            .parse::<u64>()
-            .map_err(|_| ThrottlerError::RedisConnection("Invalid last_refill format".to_string()))?;
+        let bucket_json = match &result[1] {
+            redis::Value::Data(data) => std::str::from_utf8(data)
+                .map_err(|e| ThrottlerError::Redis(format!("Invalid UTF-8 in bucket data: {}", e)))?,
+            _ => return Err(ThrottlerError::Redis("Invalid bucket data from Redis".to_string())),
+        };
 
-        let limit = result[2].as_ref()
-            .ok_or_else(|| ThrottlerError::RedisConnection("Missing limit field".to_string()))?
-            .parse::<u64>()
-            .map_err(|_| ThrottlerError::RedisConnection("Invalid limit format".to_string()))?;
+        let bucket: TokenBucket = serde_json::from_str(bucket_json)
+            .map_err(|e| ThrottlerError::Serialization(format!("Failed to deserialize updated bucket: {}", e)))?;
 
-        let refill_rate = result[3].as_ref()
-            .ok_or_else(|| ThrottlerError::RedisConnection("Missing refill_rate field".to_string()))?
-            .parse::<f64>()
-            .map_err(|_| ThrottlerError::RedisConnection("Invalid refill_rate format".to_string()))?;
-
-        let capacity = result[4].as_ref()
-            .ok_or_else(|| ThrottlerError::RedisConnection("Missing capacity field".to_string()))?
-            .parse::<u64>()
-            .map_err(|_| ThrottlerError::RedisConnection("Invalid capacity format".to_string()))?;
-
-        debug!("Retrieved token bucket for key {}: tokens={}, limit={}", key, tokens, limit);
-
-        Ok(Some(TokenBucketData {
-            tokens,
-            last_refill,
-            limit,
-            refill_rate,
-            capacity,
-        }))
+        Ok((success, bucket))
     }
-
-    pub async fn delete_key(&self, key: &str) -> ThrottlerResult<bool> {
-        let mut conn = self.get_connection().await?;
-        let deleted: u64 = conn
-            .del(key)
-            .await
-            .map_err(|e| self.handle_redis_error(e, "delete_key"))?;
-        
-        let was_deleted = deleted > 0;
-        debug!("Delete key {}: success={}", key, was_deleted);
-        Ok(was_deleted)
-    }
-
-    pub async fn list_keys(&self, pattern: &str) -> ThrottlerResult<Vec<String>> {
-        let mut conn = self.get_connection().await?;
-        let keys: Vec<String> = conn
-            .keys(pattern)
-            .await
-            .map_err(|e| self.handle_redis_error(e, "list_keys"))?;
-        
-        debug!("Listed {} keys matching pattern: {}", keys.len(), pattern);
-        Ok(keys)
-    }
-
-    fn handle_redis_error(&self, error: RedisError, operation: &str) -> ThrottlerError {
-        match error.kind() {
-            redis::ErrorKind::IoError => {
-                warn!("Redis IO error during {}: {}", operation, error);
-                ThrottlerError::RedisConnection(format!("Connection lost during {}", operation))
-            }
-            redis::ErrorKind::AuthenticationFailed => {
-                error!("Redis authentication failed during {}: {}", operation, error);
-                ThrottlerError::RedisConnection("Authentication failed".to_string())
-            }
-            _ => {
-                error!("Redis error during {}: {}", operation, error);
-                ThrottlerError::RedisConnection(format!("Redis error: {}", error))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TokenBucketData {
-    pub tokens: f64,
-    pub last_refill: u64,
-    pub limit: u64,
-    pub refill_rate: f64,
-    pub capacity: u64,
 }
