@@ -1,101 +1,77 @@
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
-use serde_json::json;
-use thiserror::Error;
+//! Error handling for the throttler service.
 
-#[derive(Error, Debug)]
+use std::fmt;
+
+/// Errors that can occur in the throttler service
+#[derive(Debug, Clone)]
 pub enum ThrottlerError {
-    #[error("Configuration error: {0}")]
+    /// Redis connection or operation error
+    Redis(String),
+    /// Configuration validation error
     Config(String),
-    
-    #[error("Redis connection error: {0}")]
-    RedisConnection(#[from] redis::RedisError),
-    
-    #[error("Redis operation failed: {0}")]
-    RedisOperation(String),
-    
-    #[error("Rate limiter error: {0}")]
-    RateLimiter(String),
-    
-    #[error("Validation error: {0}")]
-    Validation(String),
-    
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-    
-    #[error("Environment error: {0}")]
-    Environment(#[from] std::env::VarError),
-    
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("Internal server error: {0}")]
-    Internal(String),
-    
-    #[error("Resource not found: {0}")]
-    NotFound(String),
-    
-    #[error("Bad request: {0}")]
+    /// Rate limit exceeded
+    RateLimitExceeded {
+        limit: u32,
+        window_seconds: u32,
+        retry_after: u32,
+    },
+    /// Invalid request format or parameters
     BadRequest(String),
+    /// Resource not found
+    NotFound(String),
+    /// Internal server error
+    Internal(String),
+    /// Serialization/deserialization error
+    Serialization(String),
+    /// Validation error
+    Validation(String),
+    /// Health check failure
+    HealthCheck(String),
+    /// Missing API key in request
+    MissingApiKey,
+    /// Missing user ID in request
+    MissingUserId,
+    /// Invalid key generation strategy
+    InvalidKeyStrategy(String),
 }
 
-impl IntoResponse for ThrottlerError {
-    fn into_response(self) -> Response {
-        let (status, error_message) = match &self {
-            ThrottlerError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-            ThrottlerError::RedisConnection(_) => (StatusCode::SERVICE_UNAVAILABLE, "Service temporarily unavailable".to_string()),
-            ThrottlerError::RedisOperation(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal service error".to_string()),
-            ThrottlerError::RateLimiter(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-            ThrottlerError::Validation(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ThrottlerError::Serialization(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Data processing error".to_string()),
-            ThrottlerError::Environment(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Configuration error".to_string()),
-            ThrottlerError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "IO operation failed".to_string()),
-            ThrottlerError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
-            ThrottlerError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            ThrottlerError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-        };
-
-        let body = Json(json!({
-            "error": error_message,
-            "type": self.error_type(),
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        }));
-
-        (status, body).into_response()
-    }
-}
-
-impl ThrottlerError {
-    pub fn error_type(&self) -> &'static str {
+impl fmt::Display for ThrottlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ThrottlerError::Config(_) => "config_error",
-            ThrottlerError::RedisConnection(_) => "redis_connection_error",
-            ThrottlerError::RedisOperation(_) => "redis_operation_error",
-            ThrottlerError::RateLimiter(_) => "rate_limiter_error",
-            ThrottlerError::Validation(_) => "validation_error",
-            ThrottlerError::Serialization(_) => "serialization_error",
-            ThrottlerError::Environment(_) => "environment_error",
-            ThrottlerError::Io(_) => "io_error",
-            ThrottlerError::Internal(_) => "internal_error",
-            ThrottlerError::NotFound(_) => "not_found",
-            ThrottlerError::BadRequest(_) => "bad_request",
+            ThrottlerError::Redis(msg) => write!(f, "Redis error: {}", msg),
+            ThrottlerError::Config(msg) => write!(f, "Configuration error: {}", msg),
+            ThrottlerError::RateLimitExceeded {
+                limit,
+                window_seconds,
+                retry_after,
+            } => write!(
+                f,
+                "Rate limit exceeded: {} requests per {} seconds, retry after {} seconds",
+                limit, window_seconds, retry_after
+            ),
+            ThrottlerError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
+            ThrottlerError::NotFound(msg) => write!(f, "Not found: {}", msg),
+            ThrottlerError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            ThrottlerError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
+            ThrottlerError::Validation(msg) => write!(f, "Validation error: {}", msg),
+            ThrottlerError::HealthCheck(msg) => write!(f, "Health check failed: {}", msg),
+            ThrottlerError::MissingApiKey => write!(f, "Missing API key in request headers"),
+            ThrottlerError::MissingUserId => write!(f, "Missing user ID in request headers"),
+            ThrottlerError::InvalidKeyStrategy(msg) => write!(f, "Invalid key strategy: {}", msg),
         }
     }
-    
-    pub fn is_redis_related(&self) -> bool {
-        matches!(self, ThrottlerError::RedisConnection(_) | ThrottlerError::RedisOperation(_))
+}
+
+impl std::error::Error for ThrottlerError {}
+
+impl From<redis::RedisError> for ThrottlerError {
+    fn from(error: redis::RedisError) -> Self {
+        ThrottlerError::Redis(error.to_string())
     }
 }
 
-// Helper function for creating validation errors
-pub fn validation_error(message: impl Into<String>) -> ThrottlerError {
-    ThrottlerError::Validation(message.into())
-}
-
-// Helper function for creating internal errors
-pub fn internal_error(message: impl Into<String>) -> ThrottlerError {
-    ThrottlerError::Internal(message.into())
+impl From<serde_json::Error> for ThrottlerError {
+    fn from(error: serde_json::Error) -> Self {
+        ThrottlerError::Serialization(error.to_string())
+    }
 }
