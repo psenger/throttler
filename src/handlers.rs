@@ -1,185 +1,169 @@
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::Json,
-};
+use crate::error::{ThrottlerError, Result};
+use crate::rate_limiter::RateLimiter;
+use crate::response::ThrottleResponse;
+use crate::validation::RequestValidator;
+use crate::key_generator::KeyGenerator;
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
+use std::sync::Arc;
 
-use crate::{
-    error::AppError,
-    health::HealthChecker,
-    metrics::MetricsCollector,
-    rate_limit_config::{RateLimitConfig, RateLimitRule},
-    response::ApiResponse,
-    throttler::Throttler,
-    validation::ValidationError,
-};
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CheckRequest {
+    pub key: String,
+    pub requests: Option<u64>,
+    pub window_ms: Option<u64>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
 
 #[derive(Debug, Deserialize)]
-pub struct CheckRateLimitQuery {
-    pub client_id: String,
-    pub endpoint: Option<String>,
+pub struct ConfigRequest {
+    pub key: String,
+    pub requests: u64,
+    pub window_ms: u64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct RateLimitStatus {
-    pub allowed: bool,
-    pub remaining: u64,
-    pub reset_time: u64,
-    pub retry_after: Option<u64>,
+pub struct ThrottleHandlers {
+    rate_limiter: Arc<RateLimiter>,
+    validator: RequestValidator,
+    key_generator: KeyGenerator,
 }
 
-#[derive(Debug, Clone)]
-pub struct AppState {
-    pub throttler: Throttler,
-    pub health_checker: HealthChecker,
-    pub metrics: MetricsCollector,
-}
+impl ThrottleHandlers {
+    pub fn new(rate_limiter: Arc<RateLimiter>) -> Self {
+        Self {
+            rate_limiter,
+            validator: RequestValidator::new(),
+            key_generator: KeyGenerator::new(),
+        }
+    }
 
-pub async fn health_check(
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<crate::health::HealthStatus>>, AppError> {
-    let health_status = state.health_checker.check_health().await?;
-    
-    let response = ApiResponse {
-        success: health_status.status == "healthy",
-        data: Some(health_status),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+    pub async fn check_rate_limit(
+        &self,
+        req: web::Json<CheckRequest>,
+        http_req: HttpRequest,
+    ) -> Result<HttpResponse> {
+        // Validate input
+        self.validator.validate_key(&req.key)?;
+        
+        if let Some(headers) = Some(&req.headers) {
+            self.validator.validate_headers(headers)?;
+        }
 
-pub async fn check_rate_limit(
-    Query(query): Query<CheckRateLimitQuery>,
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<RateLimitStatus>>, AppError> {
-    let endpoint = query.endpoint.unwrap_or_else(|| "default".to_string());
-    
-    let result = state.throttler.check_rate_limit(
-        &query.client_id,
-        &endpoint,
-    ).await?;
-    
-    state.metrics.record_rate_limit_check(&query.client_id, &endpoint, result.allowed).await;
-    
-    let status = RateLimitStatus {
-        allowed: result.allowed,
-        remaining: result.remaining,
-        reset_time: result.reset_time,
-        retry_after: if result.allowed { None } else { Some(result.retry_after) },
-    };
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(status),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+        let requests = req.requests.unwrap_or(100);
+        let window_ms = req.window_ms.unwrap_or(60000);
 
-pub async fn create_rate_limit_config(
-    State(state): State<AppState>,
-    Json(config): Json<RateLimitConfig>,
-) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
-    // Validate the configuration
-    config.validate().map_err(|e| AppError::Validation(e))?;
-    
-    state.throttler.create_config(config.clone()).await?;
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(config),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+        self.validator.validate_rate_limit(requests, window_ms)?;
 
-pub async fn get_rate_limit_config(
-    Path(config_id): Path<Uuid>,
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
-    let config = state.throttler.get_config(config_id).await?;
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(config),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+        // Generate full key with client info if needed
+        let client_ip = http_req
+            .connection_info()
+            .realip_remote_addr()
+            .unwrap_or("unknown")
+            .to_string();
 
-pub async fn update_rate_limit_config(
-    Path(config_id): Path<Uuid>,
-    State(state): State<AppState>,
-    Json(mut config): Json<RateLimitConfig>,
-) -> Result<Json<ApiResponse<RateLimitConfig>>, AppError> {
-    config.id = config_id;
-    config.validate().map_err(|e| AppError::Validation(e))?;
-    
-    state.throttler.update_config(config.clone()).await?;
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(config),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+        let full_key = if req.key.contains(':') {
+            req.key.clone()
+        } else {
+            self.key_generator.generate_key(&req.key, Some(&client_ip), &req.headers)
+        };
 
-pub async fn delete_rate_limit_config(
-    Path(config_id): Path<Uuid>,
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.throttler.delete_config(config_id).await?;
-    
-    let response = ApiResponse {
-        success: true,
-        data: None,
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+        // Check rate limit
+        match self.rate_limiter.check_rate_limit(&full_key, requests, window_ms).await {
+            Ok(response) => {
+                let http_response = HttpResponse::Ok()
+                    .insert_header(("X-RateLimit-Limit", requests.to_string()))
+                    .insert_header(("X-RateLimit-Remaining", response.remaining.to_string()))
+                    .insert_header(("X-RateLimit-Reset", response.reset_time.to_string()))
+                    .insert_header(("X-RateLimit-Window", window_ms.to_string()));
 
-pub async fn list_rate_limit_configs(
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<Vec<RateLimitConfig>>>, AppError> {
-    let configs = state.throttler.list_configs().await?;
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(configs),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
-}
+                Ok(http_response.json(response))
+            },
+            Err(ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms }) => {
+                Err(ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms })
+            },
+            Err(e) => Err(e),
+        }
+    }
 
-pub async fn get_metrics(
-    State(state): State<AppState>,
-) -> Result<Json<ApiResponse<crate::metrics::MetricsSummary>>, AppError> {
-    let metrics = state.metrics.get_summary().await;
-    
-    let response = ApiResponse {
-        success: true,
-        data: Some(metrics),
-        error: None,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-    };
-    
-    Ok(Json(response))
+    pub async fn configure_rate_limit(
+        &self,
+        req: web::Json<ConfigRequest>,
+    ) -> Result<HttpResponse> {
+        // Validate input
+        self.validator.validate_key(&req.key)?;
+        self.validator.validate_rate_limit(req.requests, req.window_ms)?;
+
+        // Store configuration
+        self.rate_limiter
+            .set_rate_limit_config(&req.key, req.requests, req.window_ms)
+            .await?;
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "success",
+            "message": "Rate limit configuration updated",
+            "key": req.key,
+            "requests": req.requests,
+            "window_ms": req.window_ms
+        })))
+    }
+
+    pub async fn get_rate_limit_config(
+        &self,
+        path: web::Path<String>,
+    ) -> Result<HttpResponse> {
+        let key = path.into_inner();
+        self.validator.validate_key(&key)?;
+
+        match self.rate_limiter.get_rate_limit_config(&key).await {
+            Ok(Some(config)) => {
+                Ok(HttpResponse::Ok().json(serde_json::json!({
+                    "key": key,
+                    "requests": config.requests,
+                    "window_ms": config.window_ms,
+                    "created_at": config.created_at
+                })))
+            },
+            Ok(None) => {
+                Ok(HttpResponse::NotFound().json(serde_json::json!({
+                    "error": "not_found",
+                    "message": format!("No configuration found for key: {}", key)
+                })))
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn delete_rate_limit_config(
+        &self,
+        path: web::Path<String>,
+    ) -> Result<HttpResponse> {
+        let key = path.into_inner();
+        self.validator.validate_key(&key)?;
+
+        self.rate_limiter.delete_rate_limit_config(&key).await?;
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "success",
+            "message": "Rate limit configuration deleted",
+            "key": key
+        })))
+    }
+
+    pub async fn reset_rate_limit(
+        &self,
+        path: web::Path<String>,
+    ) -> Result<HttpResponse> {
+        let key = path.into_inner();
+        self.validator.validate_key(&key)?;
+
+        self.rate_limiter.reset_rate_limit(&key).await?;
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "status": "success",
+            "message": "Rate limit reset",
+            "key": key
+        })))
+    }
 }
