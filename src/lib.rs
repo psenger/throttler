@@ -1,8 +1,10 @@
 //! Throttler - A lightweight Rust web API rate limiting service
 //!
-//! This crate provides rate limiting and request throttling capabilities
-//! with Redis-backed distributed storage and token bucket algorithms.
+//! This library provides rate limiting and request throttling capabilities
+//! with support for multiple algorithms, Redis-backed distributed throttling,
+//! and a RESTful configuration API.
 
+pub mod algorithms;
 pub mod config;
 pub mod config_validator;
 pub mod error;
@@ -20,9 +22,15 @@ pub mod throttler;
 pub mod token_bucket;
 pub mod validation;
 
-pub use config::Config;
+// Re-export commonly used types
+pub use algorithms::{AlgorithmConfig, AlgorithmState, RateLimitAlgorithm};
+pub use config::{Config, RateLimitRule};
 pub use error::ThrottlerError;
-pub use key_generator::{KeyGenerator, KeyStrategy};
 pub use rate_limiter::RateLimiter;
-pub use server::Server;
 pub use throttler::Throttler;
+
+/// Result type alias for throttler operations
+pub type Result<T> = std::result::Result<T, ThrottlerError>;
+
+/// Version of the throttler library
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
