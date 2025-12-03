@@ -18,17 +18,21 @@ redis = { version = "0.24", features = ["tokio-comp"] }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 dotenv = "0.15"
-config = "0.14"
 validator = { version = "0.18", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4"] }
 clap = { version = "4.0", features = ["derive"] }
+regex = "1.10"
+humantime-serde = "1.1"
+anyhow = "1.0"
 
 [dev-dependencies]
 reqwest = { version = "0.11", features = ["json"] }
 tokio-test = "0.4"
+hyper = "1.0"
+http-body-util = "0.1"
 
 [lib]
 name = "throttler"

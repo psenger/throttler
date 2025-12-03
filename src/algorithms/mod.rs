@@ -3,33 +3,45 @@
 //! This module contains different rate limiting algorithm implementations
 //! that can be used by the throttler service.
 
-pub mod token_bucket;
-pub mod sliding_window;
+// Note: sliding_window requires Redis async features not currently configured
+// pub mod sliding_window;
 
 use crate::error::ThrottlerError;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+// Re-export the token bucket from the crate root
+pub use crate::token_bucket::TokenBucket;
 
 /// Configuration for rate limiting algorithms
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlgorithmConfig {
     pub capacity: u64,
     pub refill_rate: u64,
+    #[serde(with = "humantime_serde")]
     pub window_size: Duration,
 }
 
+impl Default for AlgorithmConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 100,
+            refill_rate: 10,
+            window_size: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Trait for rate limiting algorithms
-#[async_trait]
 pub trait RateLimitAlgorithm: Send + Sync {
     /// Check if a request should be allowed
-    async fn is_allowed(&self, key: &str, tokens: u64) -> Result<bool, ThrottlerError>;
-    
+    fn is_allowed(&self, key: &str, tokens: u64) -> Result<bool, ThrottlerError>;
+
     /// Get the current state of the rate limiter for a key
-    async fn get_state(&self, key: &str) -> Result<AlgorithmState, ThrottlerError>;
-    
+    fn get_state(&self, key: &str) -> Result<AlgorithmState, ThrottlerError>;
+
     /// Reset the rate limiter for a key
-    async fn reset(&self, key: &str) -> Result<(), ThrottlerError>;
+    fn reset(&self, key: &str) -> Result<(), ThrottlerError>;
 }
 
 /// Current state of a rate limiter

@@ -52,13 +52,13 @@ impl KeyGenerator {
                 let api_key = headers
                     .get("x-api-key")
                     .or_else(|| headers.get("authorization"))
-                    .ok_or_else(|| ThrottlerError::MissingApiKey)?;
+                    .ok_or_else(|| ThrottlerError::ValidationError("Missing API key".to_string()))?;
                 Ok(format!("throttle:api:{}:{}", api_key, path))
             }
             KeyStrategy::UserId => {
                 let user_id = headers
                     .get("x-user-id")
-                    .ok_or_else(|| ThrottlerError::MissingUserId)?;
+                    .ok_or_else(|| ThrottlerError::ValidationError("Missing user ID".to_string()))?;
                 Ok(format!("throttle:user:{}:{}", user_id, path))
             }
             KeyStrategy::Composite(strategies) => {
@@ -69,14 +69,14 @@ impl KeyGenerator {
                         KeyStrategy::ApiKey => headers
                             .get("x-api-key")
                             .or_else(|| headers.get("authorization"))
-                            .ok_or_else(|| ThrottlerError::MissingApiKey)?
+                            .ok_or_else(|| ThrottlerError::ValidationError("Missing API key".to_string()))?
                             .clone(),
                         KeyStrategy::UserId => headers
                             .get("x-user-id")
-                            .ok_or_else(|| ThrottlerError::MissingUserId)?
+                            .ok_or_else(|| ThrottlerError::ValidationError("Missing user ID".to_string()))?
                             .clone(),
                         KeyStrategy::Composite(_) => {
-                            return Err(ThrottlerError::InvalidKeyStrategy(
+                            return Err(ThrottlerError::ValidationError(
                                 "Nested composite keys not supported".to_string(),
                             ))
                         }
@@ -93,8 +93,8 @@ impl KeyGenerator {
         headers
             .get("x-forwarded-for")
             .and_then(|xff| xff.split(',').next().map(|ip| ip.trim()))
-            .or_else(|| headers.get("x-real-ip"))
-            .or_else(|| headers.get("cf-connecting-ip"))
+            .or_else(|| headers.get("x-real-ip").map(|s| s.as_str()))
+            .or_else(|| headers.get("cf-connecting-ip").map(|s| s.as_str()))
             .unwrap_or("unknown")
             .to_string()
     }

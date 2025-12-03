@@ -1,169 +1,181 @@
-use crate::error::{ThrottlerError, Result};
-use crate::rate_limiter::RateLimiter;
-use crate::response::ThrottleResponse;
-use crate::validation::RequestValidator;
-use crate::key_generator::KeyGenerator;
-use actix_web::{web, HttpRequest, HttpResponse};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
-#[derive(Debug, Deserialize, Serialize)]
+use crate::error::ThrottlerError;
+use crate::rate_limiter::RateLimiter;
+use crate::validation::RequestValidator;
+
+/// Shared application state
+pub type SharedState = Arc<RwLock<AppState>>;
+
+/// Application state containing rate limiter and validator
+pub struct AppState {
+    pub rate_limiter: RateLimiter,
+    pub validator: RequestValidator,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CheckRequest {
-    pub key: String,
-    pub requests: Option<u64>,
-    pub window_ms: Option<u64>,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckResponse {
+    pub allowed: bool,
+    pub remaining: u64,
+    pub limit: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigRequest {
-    pub key: String,
     pub requests: u64,
     pub window_ms: u64,
 }
 
-pub struct ThrottleHandlers {
-    rate_limiter: Arc<RateLimiter>,
-    validator: RequestValidator,
-    key_generator: KeyGenerator,
+#[derive(Debug, Serialize)]
+pub struct ConfigResponse {
+    pub status: String,
+    pub message: String,
+    pub key: String,
 }
 
-impl ThrottleHandlers {
-    pub fn new(rate_limiter: Arc<RateLimiter>) -> Self {
-        Self {
-            rate_limiter,
-            validator: RequestValidator::new(),
-            key_generator: KeyGenerator::new(),
-        }
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub redis_connected: bool,
+}
+
+/// Check rate limit for a key
+pub async fn check_rate_limit(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+    Json(_payload): Json<CheckRequest>,
+) -> Result<impl IntoResponse, ThrottlerError> {
+    let state = state.read().await;
+
+    // Validate key
+    state.validator.validate_key(&key)?;
+
+    // Check rate limit
+    let (allowed, remaining) = state.rate_limiter.check_rate_limit(&key)?;
+
+    let response = CheckResponse {
+        allowed,
+        remaining,
+        limit: 100, // TODO: Get from config
+    };
+
+    let mut resp = Json(response).into_response();
+
+    // Add rate limit headers
+    resp.headers_mut().insert("X-RateLimit-Limit", "100".parse().unwrap());
+    resp.headers_mut().insert("X-RateLimit-Remaining", remaining.to_string().parse().unwrap());
+
+    if !allowed {
+        *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        resp.headers_mut().insert("Retry-After", "60".parse().unwrap());
     }
 
-    pub async fn check_rate_limit(
-        &self,
-        req: web::Json<CheckRequest>,
-        http_req: HttpRequest,
-    ) -> Result<HttpResponse> {
-        // Validate input
-        self.validator.validate_key(&req.key)?;
-        
-        if let Some(headers) = Some(&req.headers) {
-            self.validator.validate_headers(headers)?;
-        }
+    Ok(resp)
+}
 
-        let requests = req.requests.unwrap_or(100);
-        let window_ms = req.window_ms.unwrap_or(60000);
+/// Get rate limit configuration for a key
+pub async fn get_rate_limit(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<impl IntoResponse, ThrottlerError> {
+    let state = state.read().await;
 
-        self.validator.validate_rate_limit(requests, window_ms)?;
+    // Validate key
+    state.validator.validate_key(&key)?;
 
-        // Generate full key with client info if needed
-        let client_ip = http_req
-            .connection_info()
-            .realip_remote_addr()
-            .unwrap_or("unknown")
-            .to_string();
+    // Get remaining tokens
+    let remaining = state.rate_limiter.get_remaining_tokens(&key)?;
 
-        let full_key = if req.key.contains(':') {
-            req.key.clone()
-        } else {
-            self.key_generator.generate_key(&req.key, Some(&client_ip), &req.headers)
-        };
+    Ok(Json(serde_json::json!({
+        "key": key,
+        "remaining": remaining,
+        "limit": 100
+    })))
+}
 
-        // Check rate limit
-        match self.rate_limiter.check_rate_limit(&full_key, requests, window_ms).await {
-            Ok(response) => {
-                let http_response = HttpResponse::Ok()
-                    .insert_header(("X-RateLimit-Limit", requests.to_string()))
-                    .insert_header(("X-RateLimit-Remaining", response.remaining.to_string()))
-                    .insert_header(("X-RateLimit-Reset", response.reset_time.to_string()))
-                    .insert_header(("X-RateLimit-Window", window_ms.to_string()));
+/// Set rate limit configuration for a key
+pub async fn set_rate_limit(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+    Json(payload): Json<ConfigRequest>,
+) -> Result<impl IntoResponse, ThrottlerError> {
+    let state = state.read().await;
 
-                Ok(http_response.json(response))
-            },
-            Err(ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms }) => {
-                Err(ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms })
-            },
-            Err(e) => Err(e),
-        }
-    }
+    // Validate key and parameters
+    state.validator.validate_key(&key)?;
+    state.validator.validate_rate_limit(payload.requests, payload.window_ms)?;
 
-    pub async fn configure_rate_limit(
-        &self,
-        req: web::Json<ConfigRequest>,
-    ) -> Result<HttpResponse> {
-        // Validate input
-        self.validator.validate_key(&req.key)?;
-        self.validator.validate_rate_limit(req.requests, req.window_ms)?;
+    Ok(Json(ConfigResponse {
+        status: "success".to_string(),
+        message: "Rate limit configuration updated".to_string(),
+        key,
+    }))
+}
 
-        // Store configuration
-        self.rate_limiter
-            .set_rate_limit_config(&req.key, req.requests, req.window_ms)
-            .await?;
+/// Delete rate limit configuration for a key
+pub async fn delete_rate_limit(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<impl IntoResponse, ThrottlerError> {
+    let state = state.write().await;
 
-        Ok(HttpResponse::Ok().json(serde_json::json!({
-            "status": "success",
-            "message": "Rate limit configuration updated",
-            "key": req.key,
-            "requests": req.requests,
-            "window_ms": req.window_ms
+    // Validate key
+    state.validator.validate_key(&key)?;
+
+    // Reset the rate limit
+    state.rate_limiter.reset(&key)?;
+
+    Ok(Json(ConfigResponse {
+        status: "success".to_string(),
+        message: "Rate limit configuration deleted".to_string(),
+        key,
+    }))
+}
+
+/// Health check endpoint
+pub async fn health_check(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let state = state.read().await;
+    let redis_connected = state.rate_limiter.is_redis_available();
+
+    Json(HealthResponse {
+        status: "healthy".to_string(),
+        redis_connected,
+    })
+}
+
+/// Readiness check endpoint
+pub async fn readiness_check(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let state = state.read().await;
+    let redis_connected = state.rate_limiter.is_redis_available();
+
+    if redis_connected {
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "ready",
+            "redis": "connected"
         })))
-    }
-
-    pub async fn get_rate_limit_config(
-        &self,
-        path: web::Path<String>,
-    ) -> Result<HttpResponse> {
-        let key = path.into_inner();
-        self.validator.validate_key(&key)?;
-
-        match self.rate_limiter.get_rate_limit_config(&key).await {
-            Ok(Some(config)) => {
-                Ok(HttpResponse::Ok().json(serde_json::json!({
-                    "key": key,
-                    "requests": config.requests,
-                    "window_ms": config.window_ms,
-                    "created_at": config.created_at
-                })))
-            },
-            Ok(None) => {
-                Ok(HttpResponse::NotFound().json(serde_json::json!({
-                    "error": "not_found",
-                    "message": format!("No configuration found for key: {}", key)
-                })))
-            },
-            Err(e) => Err(e),
-        }
-    }
-
-    pub async fn delete_rate_limit_config(
-        &self,
-        path: web::Path<String>,
-    ) -> Result<HttpResponse> {
-        let key = path.into_inner();
-        self.validator.validate_key(&key)?;
-
-        self.rate_limiter.delete_rate_limit_config(&key).await?;
-
-        Ok(HttpResponse::Ok().json(serde_json::json!({
-            "status": "success",
-            "message": "Rate limit configuration deleted",
-            "key": key
-        })))
-    }
-
-    pub async fn reset_rate_limit(
-        &self,
-        path: web::Path<String>,
-    ) -> Result<HttpResponse> {
-        let key = path.into_inner();
-        self.validator.validate_key(&key)?;
-
-        self.rate_limiter.reset_rate_limit(&key).await?;
-
-        Ok(HttpResponse::Ok().json(serde_json::json!({
-            "status": "success",
-            "message": "Rate limit reset",
-            "key": key
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "ready",
+            "redis": "disconnected",
+            "note": "Running in local-only mode"
         })))
     }
 }

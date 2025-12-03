@@ -1,63 +1,68 @@
 use crate::error::ThrottlerError;
-use crate::rate_limit_config::RateLimitConfig;
-use std::collections::HashMap;
 
 /// Validates configuration objects for consistency and correctness
 pub struct ConfigValidator;
 
 impl ConfigValidator {
-    /// Validates a rate limit configuration
-    pub fn validate_rate_limit_config(config: &RateLimitConfig) -> Result<(), ThrottlerError> {
-        if config.capacity == 0 {
+    /// Validates a Redis URL
+    pub fn validate_redis_url(url: &str) -> Result<(), ThrottlerError> {
+        if url.is_empty() {
             return Err(ThrottlerError::ValidationError(
-                "Rate limit capacity must be greater than 0".to_string(),
+                "Redis URL cannot be empty".to_string(),
             ));
         }
 
-        if config.refill_rate == 0.0 {
+        if !url.starts_with("redis://") && !url.starts_with("rediss://") {
             return Err(ThrottlerError::ValidationError(
-                "Refill rate must be greater than 0".to_string(),
-            ));
-        }
-
-        if config.window_size_seconds == 0 {
-            return Err(ThrottlerError::ValidationError(
-                "Window size must be greater than 0 seconds".to_string(),
-            ));
-        }
-
-        // Validate that refill rate doesn't exceed capacity per window
-        let max_refill_per_window = config.refill_rate * config.window_size_seconds as f64;
-        if max_refill_per_window > config.capacity as f64 * 2.0 {
-            return Err(ThrottlerError::ValidationError(
-                "Refill rate is too high for the given capacity and window size".to_string(),
+                "Redis URL must start with 'redis://' or 'rediss://'".to_string(),
             ));
         }
 
         Ok(())
     }
 
-    /// Validates multiple rate limit configurations for conflicts
-    pub fn validate_rate_limit_configs(
-        configs: &HashMap<String, RateLimitConfig>,
-    ) -> Result<(), ThrottlerError> {
-        if configs.is_empty() {
+    /// Validates a bind address
+    pub fn validate_bind_address(address: &str) -> Result<(), ThrottlerError> {
+        if address.is_empty() {
             return Err(ThrottlerError::ValidationError(
-                "At least one rate limit configuration is required".to_string(),
+                "Bind address cannot be empty".to_string(),
             ));
         }
 
-        for (key, config) in configs {
-            if key.is_empty() {
-                return Err(ThrottlerError::ValidationError(
-                    "Rate limit configuration key cannot be empty".to_string(),
-                ));
-            }
+        // Check if it looks like host:port format
+        if !address.contains(':') {
+            return Err(ThrottlerError::ValidationError(
+                "Bind address must be in host:port format".to_string(),
+            ));
+        }
 
-            Self::validate_rate_limit_config(config)
-                .map_err(|e| ThrottlerError::ValidationError(
-                    format!("Invalid configuration for key '{}': {}", key, e)
-                ))?;
+        Ok(())
+    }
+
+    /// Validates rate limit parameters
+    pub fn validate_rate_limit(capacity: u64, refill_rate: u64) -> Result<(), ThrottlerError> {
+        if capacity == 0 {
+            return Err(ThrottlerError::ValidationError(
+                "Rate limit capacity must be greater than 0".to_string(),
+            ));
+        }
+
+        if refill_rate == 0 {
+            return Err(ThrottlerError::ValidationError(
+                "Refill rate must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates environment name
+    pub fn validate_environment(env: &str) -> Result<(), ThrottlerError> {
+        let valid_envs = ["development", "staging", "production", "test"];
+        if !valid_envs.contains(&env.to_lowercase().as_str()) {
+            return Err(ThrottlerError::ValidationError(
+                format!("Invalid environment '{}'. Must be one of: {:?}", env, valid_envs),
+            ));
         }
 
         Ok(())
@@ -81,18 +86,7 @@ impl ConfigValidator {
             ));
         }
 
-        if redis_url.is_empty() {
-            return Err(ThrottlerError::ValidationError(
-                "Redis URL cannot be empty".to_string(),
-            ));
-        }
-
-        // Basic Redis URL format validation
-        if !redis_url.starts_with("redis://") && !redis_url.starts_with("rediss://") {
-            return Err(ThrottlerError::ValidationError(
-                "Redis URL must start with 'redis://' or 'rediss://'".to_string(),
-            ));
-        }
+        Self::validate_redis_url(redis_url)?;
 
         Ok(())
     }
@@ -103,36 +97,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_valid_rate_limit_config() {
-        let config = RateLimitConfig {
-            capacity: 100,
-            refill_rate: 10.0,
-            window_size_seconds: 60,
-        };
-
-        assert!(ConfigValidator::validate_rate_limit_config(&config).is_ok());
+    fn test_valid_redis_url() {
+        assert!(ConfigValidator::validate_redis_url("redis://localhost:6379").is_ok());
+        assert!(ConfigValidator::validate_redis_url("rediss://localhost:6379").is_ok());
     }
 
     #[test]
-    fn test_invalid_capacity() {
-        let config = RateLimitConfig {
-            capacity: 0,
-            refill_rate: 10.0,
-            window_size_seconds: 60,
-        };
-
-        assert!(ConfigValidator::validate_rate_limit_config(&config).is_err());
+    fn test_invalid_redis_url() {
+        assert!(ConfigValidator::validate_redis_url("").is_err());
+        assert!(ConfigValidator::validate_redis_url("http://localhost:6379").is_err());
     }
 
     #[test]
-    fn test_invalid_refill_rate() {
-        let config = RateLimitConfig {
-            capacity: 100,
-            refill_rate: 0.0,
-            window_size_seconds: 60,
-        };
+    fn test_valid_bind_address() {
+        assert!(ConfigValidator::validate_bind_address("127.0.0.1:8080").is_ok());
+        assert!(ConfigValidator::validate_bind_address("0.0.0.0:3000").is_ok());
+    }
 
-        assert!(ConfigValidator::validate_rate_limit_config(&config).is_err());
+    #[test]
+    fn test_invalid_bind_address() {
+        assert!(ConfigValidator::validate_bind_address("").is_err());
+        assert!(ConfigValidator::validate_bind_address("localhost").is_err());
+    }
+
+    #[test]
+    fn test_valid_rate_limit() {
+        assert!(ConfigValidator::validate_rate_limit(100, 10).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_rate_limit() {
+        assert!(ConfigValidator::validate_rate_limit(0, 10).is_err());
+        assert!(ConfigValidator::validate_rate_limit(100, 0).is_err());
+    }
+
+    #[test]
+    fn test_valid_environment() {
+        assert!(ConfigValidator::validate_environment("development").is_ok());
+        assert!(ConfigValidator::validate_environment("production").is_ok());
+    }
+
+    #[test]
+    fn test_invalid_environment() {
+        assert!(ConfigValidator::validate_environment("invalid").is_err());
     }
 
     #[test]
@@ -145,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_redis_url() {
+    fn test_invalid_server_config() {
         assert!(ConfigValidator::validate_server_config(
             "127.0.0.1",
             8080,

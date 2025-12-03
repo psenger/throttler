@@ -1,8 +1,7 @@
 use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
-use redis::AsyncCommands;
-use crate::redis::RedisPool;
-use crate::error::AppError;
+
+use crate::rate_limiter::RateLimiter;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthStatus {
@@ -28,29 +27,29 @@ pub struct ServiceStatus {
 static START_TIME: std::sync::LazyLock<SystemTime> = std::sync::LazyLock::new(SystemTime::now);
 
 pub struct HealthChecker {
-    redis_pool: RedisPool,
+    rate_limiter: RateLimiter,
 }
 
 impl HealthChecker {
-    pub fn new(redis_pool: RedisPool) -> Self {
-        Self { redis_pool }
+    pub fn new(rate_limiter: RateLimiter) -> Self {
+        Self { rate_limiter }
     }
 
-    pub async fn check_health(&self) -> Result<HealthStatus, AppError> {
+    pub fn check_health(&self) -> HealthStatus {
         let now = SystemTime::now();
         let uptime = now.duration_since(*START_TIME)
             .unwrap_or_default()
             .as_secs();
 
-        let redis_status = self.check_redis().await;
+        let redis_status = self.check_redis();
 
         let overall_status = if redis_status.status == "healthy" {
             "healthy"
         } else {
-            "unhealthy"
+            "degraded" // Not unhealthy, just running without Redis
         };
 
-        Ok(HealthStatus {
+        HealthStatus {
             status: overall_status.to_string(),
             timestamp: now.duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -60,42 +59,30 @@ impl HealthChecker {
             dependencies: DependencyStatus {
                 redis: redis_status,
             },
-        })
+        }
     }
 
-    async fn check_redis(&self) -> ServiceStatus {
+    fn check_redis(&self) -> ServiceStatus {
         let start = SystemTime::now();
-        
-        match self.redis_pool.get().await {
-            Ok(mut conn) => {
-                match conn.ping().await {
-                    Ok(_) => {
-                        let response_time = start.elapsed()
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        
-                        ServiceStatus {
-                            status: "healthy".to_string(),
-                            response_time_ms: response_time,
-                            error: None,
-                        }
-                    }
-                    Err(e) => ServiceStatus {
-                        status: "unhealthy".to_string(),
-                        response_time_ms: start.elapsed()
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                        error: Some(format!("Redis ping failed: {}", e)),
-                    },
-                }
+
+        if self.rate_limiter.is_redis_available() {
+            let response_time = start.elapsed()
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            ServiceStatus {
+                status: "healthy".to_string(),
+                response_time_ms: response_time,
+                error: None,
             }
-            Err(e) => ServiceStatus {
-                status: "unhealthy".to_string(),
+        } else {
+            ServiceStatus {
+                status: "unavailable".to_string(),
                 response_time_ms: start.elapsed()
                     .unwrap_or_default()
                     .as_millis() as u64,
-                error: Some(format!("Redis connection failed: {}", e)),
-            },
+                error: Some("Redis not configured or not reachable".to_string()),
+            }
         }
     }
 }

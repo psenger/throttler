@@ -1,9 +1,12 @@
-use crate::handlers::{check_rate_limit, delete_rate_limit, get_rate_limit, set_rate_limit, health_check, readiness_check, SharedState};
-use crate::middleware::logging_middleware;
-use crate::rate_limit_config::RateLimitConfig;
+use crate::config::Config;
+use crate::handlers::{
+    check_rate_limit, delete_rate_limit, get_rate_limit, set_rate_limit,
+    health_check, readiness_check, AppState, SharedState,
+};
+use crate::rate_limiter::RateLimiter;
+use crate::validation::RequestValidator;
 use axum::routing::{delete, get, post};
-use axum::{middleware, Router};
-use std::collections::HashMap;
+use axum::Router;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -13,45 +16,58 @@ use tokio::signal;
 
 pub struct Server {
     app: Router,
-    port: u16,
+    bind_address: String,
+}
+
+/// Create router for testing purposes
+pub fn create_app(config: Config) -> Result<Router, Box<dyn std::error::Error>> {
+    // Create rate limiter
+    let rate_limiter = RateLimiter::new(config)?;
+
+    // Create shared state
+    let state: SharedState = Arc::new(RwLock::new(AppState {
+        rate_limiter,
+        validator: RequestValidator::new(),
+    }));
+
+    let app = Router::new()
+        // Rate limiting endpoints
+        .route("/rate-limit/:key", get(get_rate_limit))
+        .route("/rate-limit/:key", post(set_rate_limit))
+        .route("/rate-limit/:key", delete(delete_rate_limit))
+        .route("/rate-limit/:key/check", post(check_rate_limit))
+        // Health and readiness endpoints
+        .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(CorsLayer::permissive())
+        );
+
+    Ok(app)
 }
 
 impl Server {
-    pub fn new(port: u16) -> Self {
-        let shared_state: SharedState = Arc::new(RwLock::new(HashMap::new()));
-
-        let app = Router::new()
-            // Rate limiting endpoints
-            .route("/rate-limit/:key", get(get_rate_limit))
-            .route("/rate-limit/:key", post(set_rate_limit))
-            .route("/rate-limit/:key", delete(delete_rate_limit))
-            .route("/rate-limit/:key/check", post(check_rate_limit))
-            // Health and readiness endpoints
-            .route("/health", get(health_check))
-            .route("/ready", get(readiness_check))
-            .with_state(shared_state)
-            .layer(
-                ServiceBuilder::new()
-                    .layer(TraceLayer::new_for_http())
-                    .layer(CorsLayer::permissive())
-                    .layer(middleware::from_fn(logging_middleware))
-            );
-
-        Self { app, port }
+    pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let bind_address = config.bind_address.clone();
+        let app = create_app(config)?;
+        Ok(Self { app, bind_address })
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
-        
-        tracing::info!("Throttler server starting on port {}", self.port);
+        let listener = tokio::net::TcpListener::bind(&self.bind_address).await?;
+
+        tracing::info!("Throttler server starting on {}", self.bind_address);
         tracing::info!("Health check available at /health");
         tracing::info!("Readiness check available at /ready");
-        
+
         // Run server with graceful shutdown
         axum::serve(listener, self.app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
-            
+
         Ok(())
     }
 }

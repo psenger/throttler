@@ -24,7 +24,8 @@ pub mod validation;
 
 // Re-export commonly used types
 pub use algorithms::{AlgorithmConfig, AlgorithmState, RateLimitAlgorithm};
-pub use config::{Config, RateLimitRule};
+pub use config::Config;
+pub use rate_limit_config::{RateLimitConfig, RateLimitRule};
 pub use error::ThrottlerError;
 pub use rate_limiter::RateLimiter;
 pub use throttler::Throttler;

@@ -1,5 +1,5 @@
 use crate::error::ThrottlerError;
-use crate::validation::ConfigValidator;
+use crate::config_validator::ConfigValidator;
 use std::env;
 
 #[derive(Debug, Clone)]
@@ -10,6 +10,19 @@ pub struct Config {
     pub default_refill_rate: u64,
     pub environment: String,
     pub log_level: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            redis_url: String::new(),
+            bind_address: "127.0.0.1:8080".to_string(),
+            default_capacity: 100,
+            default_refill_rate: 10,
+            environment: "development".to_string(),
+            log_level: "info".to_string(),
+        }
+    }
 }
 
 impl Config {

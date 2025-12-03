@@ -1,4 +1,8 @@
-use actix_web::{HttpResponse, ResponseError};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use std::fmt;
 
 #[derive(Debug, Clone)]
@@ -16,6 +20,8 @@ pub enum ThrottlerError {
     SerializationError(String),
 }
 
+impl std::error::Error for ThrottlerError {}
+
 impl fmt::Display for ThrottlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -23,7 +29,7 @@ impl fmt::Display for ThrottlerError {
             ThrottlerError::ConfigError(msg) => write!(f, "Configuration error: {}", msg),
             ThrottlerError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
             ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms } => {
-                write!(f, "Rate limit exceeded: {} requests per {}ms window. Retry after {}s", 
+                write!(f, "Rate limit exceeded: {} requests per {}ms window. Retry after {}s",
                        limit, window_ms, retry_after)
             },
             ThrottlerError::InternalError(msg) => write!(f, "Internal error: {}", msg),
@@ -33,41 +39,67 @@ impl fmt::Display for ThrottlerError {
     }
 }
 
-impl ResponseError for ThrottlerError {
-    fn error_response(&self) -> HttpResponse {
-        match self {
+impl IntoResponse for ThrottlerError {
+    fn into_response(self) -> Response {
+        let (status, body) = match &self {
             ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms } => {
-                HttpResponse::TooManyRequests()
-                    .insert_header(("Retry-After", retry_after.to_string()))
-                    .insert_header(("X-RateLimit-Limit", limit.to_string()))
-                    .insert_header(("X-RateLimit-Window", window_ms.to_string()))
-                    .json(serde_json::json!({
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    serde_json::json!({
                         "error": "rate_limit_exceeded",
                         "message": self.to_string(),
                         "retry_after_seconds": retry_after,
                         "limit": limit,
                         "window_ms": window_ms
-                    }))
+                    })
+                )
             },
             ThrottlerError::ValidationError(_) | ThrottlerError::InvalidKey(_) => {
-                HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "validation_error",
-                    "message": self.to_string()
-                }))
+                (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "validation_error",
+                        "message": self.to_string()
+                    })
+                )
             },
             ThrottlerError::ConfigError(_) => {
-                HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "configuration_error",
-                    "message": self.to_string()
-                }))
+                (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "configuration_error",
+                        "message": self.to_string()
+                    })
+                )
             },
             _ => {
-                HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": "internal_error",
-                    "message": "An unexpected error occurred"
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "error": "internal_error",
+                        "message": "An unexpected error occurred"
+                    })
+                )
+            }
+        };
+
+        let mut response = (status, Json(body)).into_response();
+
+        // Add Retry-After header for rate limit errors
+        if let ThrottlerError::RateLimitExceeded { retry_after, limit, window_ms } = &self {
+            let headers = response.headers_mut();
+            if let Ok(val) = retry_after.to_string().parse() {
+                headers.insert("Retry-After", val);
+            }
+            if let Ok(val) = limit.to_string().parse() {
+                headers.insert("X-RateLimit-Limit", val);
+            }
+            if let Ok(val) = window_ms.to_string().parse() {
+                headers.insert("X-RateLimit-Window", val);
             }
         }
+
+        response
     }
 }
 
@@ -84,3 +116,4 @@ impl From<serde_json::Error> for ThrottlerError {
 }
 
 pub type Result<T> = std::result::Result<T, ThrottlerError>;
+pub type ThrottlerResult<T> = std::result::Result<T, ThrottlerError>;

@@ -4,71 +4,149 @@ This guide covers various deployment scenarios for the throttler service.
 
 ## Prerequisites
 
-- Redis server (version 6.0 or later)
 - Rust 1.70+ (for building from source)
-- Docker (for containerized deployment)
-
-## Configuration
-
-### Environment Variables
-
-Create a `.env` file based on `.env.example`:
-
-```bash
-# Server configuration
-SERVER_HOST=0.0.0.0
-SERVER_PORT=8080
-
-# Redis configuration
-REDIS_URL=redis://localhost:6379
-REDIS_POOL_SIZE=10
-REDIS_TIMEOUT=5000
-
-# Default rate limiting
-DEFAULT_CAPACITY=100
-DEFAULT_REFILL_RATE=10
-DEFAULT_REFILL_PERIOD=60
-
-# Logging
-RUST_LOG=throttler=info
-```
+- Docker and Docker Compose
+- Redis server (version 6.0 or later) for production deployments
 
 ## Local Development
 
-### 1. Start Redis
-```bash
-# Using Docker
-docker run -d --name redis -p 6379:6379 redis:7-alpine
+### 1. Configure Environment
 
-# Or using local installation
-redis-server
+```bash
+# Copy example environment file
+cp .env.example .env
+
+# Edit .env and set a secure Redis password
+# DOCKER_REDIS_PASSWORD=your_secure_password_here
+# REDIS_URL=redis://:your_secure_password_here@127.0.0.1:6379
 ```
 
-### 2. Run the service
+### 2. Start Redis with Docker Compose
+
 ```bash
-# Clone and build
-git clone <repository-url>
-cd throttler
+# Start Redis and Redis Commander
+docker compose up -d
+
+# Verify services are running
+docker compose ps
+
+# View logs
+docker compose logs -f redis
+```
+
+Services started:
+- **Redis**: `localhost:6379` (password protected)
+- **Redis Commander**: `http://localhost:8081` (web UI)
+
+### 3. Build and Run the Service
+
+```bash
+# Build
 cargo build --release
 
-# Run with environment file
+# Run
 cargo run --release
+
+# Or run with debug logging
+RUST_LOG=debug cargo run
 ```
 
-### 3. Verify deployment
+### 4. Verify Deployment
+
 ```bash
 # Health check
 curl http://localhost:8080/health
 
+# Readiness check
+curl http://localhost:8080/ready
+
 # Test rate limiting
-curl -X POST http://localhost:8080/check \
+curl -X POST http://localhost:8080/rate-limit/test-key/check \
   -H "Content-Type: application/json" \
-  -d '{"key": "test-client", "tokens": 1}'
+  -d '{"tokens": 1}'
 ```
 
-## Docker Deployment
+## Docker Compose Reference
 
-### Single Container
+The included `docker-compose.yml` provides:
+
+```yaml
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: throttler-redis
+    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${DOCKER_REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379"  # Localhost only
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${DOCKER_REDIS_PASSWORD}", "ping"]
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: throttler-redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${DOCKER_REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+```
+
+### Docker Compose Commands
+
+```bash
+# Start services in background
+docker compose up -d
+
+# Stop services
+docker compose down
+
+# Stop and remove volumes (clears Redis data)
+docker compose down -v
+
+# View logs
+docker compose logs -f
+
+# Restart Redis
+docker compose restart redis
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `THROTTLER_HOST` | `127.0.0.1` | Server host |
+| `THROTTLER_PORT` | `8080` | Server port |
+| `DOCKER_REDIS_PASSWORD` | - | Redis password (required) |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL |
+| `REDIS_MAX_CONNECTIONS` | `10` | Redis connection pool size |
+| `REDIS_CONNECTION_TIMEOUT` | `5` | Connection timeout (seconds) |
+| `DEFAULT_RATE_LIMIT_CAPACITY` | `100` | Default bucket capacity |
+| `DEFAULT_RATE_LIMIT_REFILL` | `10` | Default refill rate |
+| `RUST_LOG` | `info` | Log level |
+
+## Production Deployment
+
+### Building for Production
+
+```bash
+# Build optimized release binary
+cargo build --release
+
+# Binary located at
+./target/release/throttler
+```
+
+### Docker Image
 
 ```dockerfile
 # Dockerfile
@@ -90,10 +168,9 @@ docker build -t throttler .
 docker run -p 8080:8080 --env-file .env throttler
 ```
 
-### Docker Compose
+### Docker Compose with Application
 
 ```yaml
-# docker-compose.yml
 version: '3.8'
 
 services:
@@ -102,46 +179,59 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - REDIS_URL=redis://redis:6379
-      - SERVER_HOST=0.0.0.0
-      - SERVER_PORT=8080
+      - REDIS_URL=redis://:${DOCKER_REDIS_PASSWORD}@redis:6379
+      - THROTTLER_HOST=0.0.0.0
+      - THROTTLER_PORT=8080
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    image: redis:7.2-alpine
+    command: redis-server --requirepass ${DOCKER_REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${DOCKER_REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   redis_data:
 ```
 
-```bash
-# Deploy with Docker Compose
-docker-compose up -d
-```
-
 ## Kubernetes Deployment
 
 ### ConfigMap
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: throttler-config
 data:
-  SERVER_HOST: "0.0.0.0"
-  SERVER_PORT: "8080"
-  REDIS_URL: "redis://redis-service:6379"
+  THROTTLER_HOST: "0.0.0.0"
+  THROTTLER_PORT: "8080"
   RUST_LOG: "throttler=info"
 ```
 
+### Secret
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: throttler-secrets
+type: Opaque
+stringData:
+  REDIS_URL: "redis://:password@redis-service:6379"
+```
+
 ### Deployment
+
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -165,21 +255,31 @@ spec:
         envFrom:
         - configMapRef:
             name: throttler-config
+        - secretRef:
+            name: throttler-secrets
         livenessProbe:
           httpGet:
             path: /health
             port: 8080
-          initialDelaySeconds: 30
+          initialDelaySeconds: 10
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /health
+            path: /ready
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
 ```
 
 ### Service
+
 ```yaml
 apiVersion: v1
 kind: Service
@@ -191,66 +291,35 @@ spec:
   ports:
   - port: 80
     targetPort: 8080
-  type: LoadBalancer
+  type: ClusterIP
 ```
 
 ## Production Considerations
 
 ### High Availability
+
 - Deploy multiple instances behind a load balancer
 - Use Redis Cluster or Redis Sentinel for Redis HA
-- Configure appropriate health checks
-
-### Monitoring
-- Set up Prometheus scraping of `/metrics` endpoint
-- Configure alerting on health check failures
-- Monitor Redis connection pool metrics
+- Configure health checks in your orchestrator
 
 ### Security
+
 - Use TLS for Redis connections in production
-- Run container as non-root user
-- Implement network policies in Kubernetes
-- Regular security updates for base images
+- Run containers as non-root user
+- Use network policies to restrict access
+- Rotate Redis passwords regularly
+- Never expose Redis Commander in production
+
+### Monitoring
+
+- Scrape `/metrics` endpoint with Prometheus
+- Set up alerts on health check failures
+- Monitor Redis connection pool metrics
+- Use Redis Commander only in development
 
 ### Performance Tuning
-- Adjust Redis connection pool size based on load
+
+- Adjust `REDIS_MAX_CONNECTIONS` based on load
 - Configure appropriate timeouts
-- Monitor memory usage and GC metrics
+- Monitor memory usage
 - Use Redis pipelining for batch operations
-
-### Backup and Recovery
-- Regular Redis backups
-- Configuration backup strategy
-- Disaster recovery procedures
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Redis Connection Failures**
-   - Check Redis server status
-   - Verify connection string
-   - Check network connectivity
-
-2. **High Response Times**
-   - Monitor Redis latency
-   - Check connection pool exhaustion
-   - Review system resource usage
-
-3. **Memory Issues**
-   - Monitor Redis memory usage
-   - Check for memory leaks in application
-   - Adjust Redis maxmemory settings
-
-### Logs and Debugging
-
-```bash
-# Enable debug logging
-export RUST_LOG=throttler=debug,redis=debug
-
-# View application logs
-docker logs throttler
-
-# Monitor Redis
-redis-cli monitor
-```

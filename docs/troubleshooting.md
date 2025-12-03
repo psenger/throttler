@@ -2,255 +2,362 @@
 
 This guide covers common issues and their solutions when running the throttler service.
 
+## Quick Diagnostics
+
+```bash
+# Check if service is running
+curl http://localhost:8080/health
+
+# Check Redis connectivity
+curl http://localhost:8080/ready
+
+# Check Docker containers
+docker compose ps
+
+# View service logs
+docker compose logs -f
+```
+
 ## Common Issues
+
+### Docker Compose Issues
+
+#### Problem: Containers won't start
+
+```
+Error: Cannot connect to the Docker daemon
+```
+
+**Solutions:**
+1. Ensure Docker Desktop is running
+2. Check Docker daemon status:
+   ```bash
+   docker info
+   ```
+
+#### Problem: Redis container unhealthy
+
+```bash
+docker compose ps
+# Shows redis as "unhealthy"
+```
+
+**Solutions:**
+1. Check Redis password is set in `.env`:
+   ```bash
+   grep DOCKER_REDIS_PASSWORD .env
+   ```
+
+2. View Redis logs:
+   ```bash
+   docker compose logs redis
+   ```
+
+3. Restart Redis:
+   ```bash
+   docker compose restart redis
+   ```
+
+#### Problem: Port already in use
+
+```
+Error: Bind for 0.0.0.0:6379 failed: port is already allocated
+```
+
+**Solutions:**
+1. Find what's using the port:
+   ```bash
+   lsof -i :6379
+   ```
+
+2. Stop conflicting service or change port in `docker-compose.yml`
 
 ### Redis Connection Issues
 
 #### Problem: Redis connection refused
+
 ```
 Error: Failed to connect to Redis: Connection refused (os error 61)
 ```
 
 **Solutions:**
-1. Ensure Redis is running:
+1. Ensure Redis container is running:
    ```bash
-   redis-cli ping
+   docker compose ps
+   docker compose up -d redis
+   ```
+
+2. Check Redis is accessible:
+   ```bash
+   docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD ping
    # Should return PONG
    ```
 
-2. Check Redis configuration in `.env`:
+3. Verify Redis URL in `.env`:
    ```env
-   REDIS_URL=redis://localhost:6379
+   REDIS_URL=redis://:your_password@127.0.0.1:6379
    ```
-
-3. Verify Redis is accessible:
-   ```bash
-   telnet localhost 6379
-   ```
-
-4. Check firewall settings and port availability
 
 #### Problem: Redis authentication failed
+
 ```
-Error: Redis authentication failed: WRONGPASS invalid username-password pair
+Error: WRONGPASS invalid username-password pair
 ```
 
-**Solution:**
-Update your Redis URL with correct credentials:
-```env
-REDIS_URL=redis://username:password@localhost:6379
-```
+**Solutions:**
+1. Ensure password matches between `.env` and Docker:
+   ```bash
+   # Check .env
+   grep DOCKER_REDIS_PASSWORD .env
+   grep REDIS_URL .env
+
+   # Password in REDIS_URL must match DOCKER_REDIS_PASSWORD
+   ```
+
+2. Restart containers after changing password:
+   ```bash
+   docker compose down
+   docker compose up -d
+   ```
+
+#### Problem: Redis Commander can't connect
+
+**Solutions:**
+1. Ensure Redis is healthy first:
+   ```bash
+   docker compose ps
+   ```
+
+2. Check Redis Commander logs:
+   ```bash
+   docker compose logs redis-commander
+   ```
+
+3. Verify password in environment:
+   ```bash
+   docker compose config | grep REDIS
+   ```
 
 ### Rate Limiting Issues
 
 #### Problem: Rate limits not working as expected
 
 **Diagnostics:**
-1. Check rate limit configuration:
+1. Check current configuration:
    ```bash
-   curl http://localhost:8080/api/v1/config
+   curl http://localhost:8080/rate-limit/your-key
    ```
 
-2. Verify token bucket parameters:
-   - `capacity`: Maximum tokens in bucket
-   - `refill_rate`: Tokens added per second
-   - `window_seconds`: Time window for rate limiting
-
-3. Test with known request patterns:
+2. Test with known pattern:
    ```bash
    # Send 10 requests quickly
    for i in {1..10}; do
-     curl -w "%{http_code}\n" -o /dev/null -s http://localhost:8080/throttle/test-key
+     curl -s -o /dev/null -w "%{http_code}\n" \
+       -X POST http://localhost:8080/rate-limit/test-key/check \
+       -H "Content-Type: application/json" \
+       -d '{}'
    done
    ```
 
-#### Problem: Inconsistent rate limiting across instances
+3. Inspect Redis state using Redis Commander:
+   ```
+   http://localhost:8081
+   ```
 
-**Solution:**
-Ensure all instances use the same Redis instance and key generation strategy:
-1. Verify `REDIS_URL` is identical across instances
-2. Check `KEY_STRATEGY` configuration
-3. Monitor Redis for key conflicts
+#### Problem: Inconsistent rate limiting across restarts
+
+**Cause:** Redis data persists between restarts.
+
+**Solutions:**
+1. Clear specific key:
+   ```bash
+   curl -X DELETE http://localhost:8080/rate-limit/your-key
+   ```
+
+2. Clear all Redis data (development only):
+   ```bash
+   docker compose down -v
+   docker compose up -d
+   ```
 
 ### Performance Issues
 
-#### Problem: High latency on throttle requests
+#### Problem: High latency on requests
 
 **Diagnostics:**
 1. Check Redis latency:
    ```bash
-   redis-cli --latency-history
+   docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD \
+     --latency-history
    ```
 
-2. Monitor application metrics:
+2. Enable debug logging:
    ```bash
-   curl http://localhost:8080/health/metrics
+   RUST_LOG=debug cargo run
    ```
 
-3. Profile request handling:
-   - Enable debug logging: `RUST_LOG=debug`
-   - Monitor connection pool usage
+3. Check container resources:
+   ```bash
+   docker stats
+   ```
 
 **Solutions:**
-1. Tune Redis connection pool:
+1. Increase Redis connection pool:
    ```env
-   REDIS_POOL_SIZE=20
-   REDIS_CONNECTION_TIMEOUT=5000
+   REDIS_MAX_CONNECTIONS=20
    ```
 
-2. Optimize token bucket parameters:
-   - Reduce `window_seconds` for faster refills
-   - Increase `capacity` to reduce Redis calls
-
-3. Use Redis clustering for high load scenarios
-
-#### Problem: Memory usage growing over time
-
-**Solution:**
-1. Set Redis key expiration:
-   ```env
-   REDIS_KEY_TTL=3600  # 1 hour
-   ```
-
-2. Monitor Redis memory usage:
+2. Check Redis memory usage:
    ```bash
-   redis-cli info memory
+   docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD \
+     INFO memory
    ```
 
-3. Implement periodic cleanup of expired keys
+#### Problem: Memory usage growing
+
+**Solutions:**
+1. Check Redis memory:
+   ```bash
+   docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD \
+     INFO memory
+   ```
+
+2. List all keys:
+   ```bash
+   docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD \
+     KEYS "throttler:*" | wc -l
+   ```
+
+3. Redis is configured with LRU eviction (`maxmemory-policy allkeys-lru`), so old keys are automatically evicted.
 
 ### Configuration Issues
 
-#### Problem: Invalid configuration values
-```
-Error: Configuration validation failed: capacity must be positive
-```
-
-**Solution:**
-Validate configuration before starting:
-```bash
-# Check current config
-curl http://localhost:8080/api/v1/config
-
-# Update with valid values
-curl -X PUT http://localhost:8080/api/v1/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "capacity": 100,
-    "refill_rate": 10.0,
-    "window_seconds": 60
-  }'
-```
-
 #### Problem: Environment variables not loaded
 
-**Solution:**
-1. Verify `.env` file location (project root)
-2. Check file permissions: `chmod 644 .env`
-3. Use absolute paths for environment files
-4. Restart service after changes
+**Solutions:**
+1. Verify `.env` file exists:
+   ```bash
+   ls -la .env
+   ```
 
-### API Issues
+2. Check file permissions:
+   ```bash
+   chmod 644 .env
+   ```
 
-#### Problem: 404 Not Found on API endpoints
+3. Source the file manually for testing:
+   ```bash
+   source .env
+   echo $REDIS_URL
+   ```
 
-**Solution:**
-Verify correct API paths:
-- Throttle check: `POST /throttle/{key}`
-- Configuration: `GET/PUT /api/v1/config`
-- Health check: `GET /health`
-- Metrics: `GET /health/metrics`
+#### Problem: Invalid configuration values
 
-#### Problem: Invalid JSON in requests
 ```
-Error: Failed to parse JSON: expected value at line 1 column 1
+Error: Configuration validation failed
 ```
 
-**Solution:**
-Validate JSON payload:
-```bash
-# Valid configuration update
-curl -X PUT http://localhost:8080/api/v1/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "capacity": 100,
-    "refill_rate": 10.0,
-    "window_seconds": 60
-  }'
-```
+**Solutions:**
+1. Check all required variables are set:
+   ```bash
+   cat .env.example
+   diff .env.example .env
+   ```
+
+2. Validate Redis URL format:
+   ```env
+   # Correct format with password
+   REDIS_URL=redis://:password@127.0.0.1:6379
+
+   # Without password (not recommended)
+   REDIS_URL=redis://127.0.0.1:6379
+   ```
+
+### Build Issues
+
+#### Problem: Cargo build fails
+
+**Solutions:**
+1. Update Rust:
+   ```bash
+   rustup update
+   ```
+
+2. Clean and rebuild:
+   ```bash
+   cargo clean
+   cargo build
+   ```
+
+3. Check Rust version (requires 1.70+):
+   ```bash
+   rustc --version
+   ```
 
 ## Debugging Tips
 
 ### Enable Debug Logging
+
 ```bash
+# All debug logs
 RUST_LOG=debug cargo run
-# or
+
+# Throttler only
 RUST_LOG=throttler=debug cargo run
+
+# Include Redis operations
+RUST_LOG=throttler=debug,redis=debug cargo run
 ```
 
-### Check Service Status
+### Inspect Redis State
+
+```bash
+# Connect to Redis
+docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD
+
+# List all throttler keys
+KEYS throttler:*
+
+# Get key value
+GET throttler:rate_limit:your-key
+
+# Monitor all commands in real-time
+MONITOR
+
+# Check key TTL
+TTL throttler:rate_limit:your-key
+```
+
+### Test Endpoints
+
 ```bash
 # Health check
-curl http://localhost:8080/health
+curl -v http://localhost:8080/health
 
-# Detailed metrics
-curl http://localhost:8080/health/metrics
+# Readiness (includes Redis check)
+curl -v http://localhost:8080/ready
 
-# Configuration status
-curl http://localhost:8080/api/v1/config
-```
-
-### Redis Debugging
-```bash
-# Monitor Redis commands
-redis-cli monitor
-
-# Check key patterns
-redis-cli keys "throttle:*"
-
-# Inspect specific key
-redis-cli get "throttle:user:123"
-```
-
-### Load Testing
-```bash
-# Simple load test
-ab -n 1000 -c 10 http://localhost:8080/throttle/test-key
-
-# With custom headers
-ab -n 1000 -c 10 -H "X-API-Key: test" http://localhost:8080/throttle/api-test
+# Rate limit check with verbose output
+curl -v -X POST http://localhost:8080/rate-limit/test/check \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 ## Getting Help
 
-If you encounter issues not covered in this guide:
+If you encounter issues not covered here:
 
-1. Check the [GitHub Issues](https://github.com/your-org/throttler/issues)
-2. Enable debug logging and collect relevant log output
-3. Include your configuration (sanitized) when reporting issues
-4. Provide steps to reproduce the problem
+1. Check container logs:
+   ```bash
+   docker compose logs
+   ```
 
-## Common Configuration Examples
+2. Enable debug logging and reproduce the issue
 
-### High-throughput API
-```env
-REDIS_POOL_SIZE=50
-THROTTLE_CAPACITY=1000
-THROTTLE_REFILL_RATE=100.0
-THROTTLE_WINDOW_SECONDS=60
-```
+3. Check GitHub Issues: https://github.com/your-org/throttler/issues
 
-### Strict rate limiting
-```env
-THROTTLE_CAPACITY=10
-THROTTLE_REFILL_RATE=1.0
-THROTTLE_WINDOW_SECONDS=60
-```
-
-### Development/testing
-```env
-RUST_LOG=debug
-REDIS_URL=redis://localhost:6379
-THROTTLE_CAPACITY=100
-THROTTLE_REFILL_RATE=50.0
-```
+4. Include in bug reports:
+   - Error message
+   - Steps to reproduce
+   - Environment (OS, Rust version, Docker version)
+   - Relevant logs (sanitized)

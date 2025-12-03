@@ -2,6 +2,58 @@
 
 This guide covers monitoring, observability, and alerting for the throttler service.
 
+## Health Endpoints
+
+### GET /health
+
+Liveness probe - returns service health status.
+
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "version": "0.1.0"
+}
+```
+
+### GET /ready
+
+Readiness probe - checks Redis connectivity.
+
+```bash
+curl http://localhost:8080/ready
+```
+
+```json
+{
+  "status": "ready",
+  "redis": "connected"
+}
+```
+
+## Redis Commander
+
+For local development, Redis Commander provides a web UI to inspect Redis state:
+
+```bash
+# Start with Docker Compose
+docker compose up -d
+
+# Open in browser
+open http://localhost:8081
+```
+
+Features:
+- View all rate limit keys (`throttler:*`)
+- Inspect token bucket state
+- Monitor key TTLs
+- Execute Redis commands
+- Real-time key updates
+
 ## Metrics Overview
 
 The throttler service exposes Prometheus-compatible metrics at the `/metrics` endpoint.
@@ -10,32 +62,23 @@ The throttler service exposes Prometheus-compatible metrics at the `/metrics` en
 
 #### Request Metrics
 - `throttler_requests_total` - Total number of requests processed
-  - Labels: `status` (allowed/denied), `client_id`, `endpoint`
+  - Labels: `status` (allowed/denied), `key`
 - `throttler_request_duration_seconds` - Request processing time histogram
   - Labels: `endpoint`, `status`
 
 #### Rate Limiting Metrics
 - `throttler_rate_limit_hits_total` - Total rate limit violations
-  - Labels: `limit_type` (global/per_client), `client_id`
-- `throttler_token_bucket_size` - Current token bucket sizes
-  - Labels: `bucket_id`, `client_id`
-- `throttler_token_bucket_refill_rate` - Token refill rates
-  - Labels: `bucket_id`
+  - Labels: `key`
+- `throttler_tokens_remaining` - Current available tokens per key
+  - Labels: `key`
 
 #### System Metrics
 - `throttler_redis_operations_total` - Redis operation count
   - Labels: `operation` (get/set/del), `status` (success/error)
-- `throttler_redis_connection_pool_size` - Active Redis connections
-- `throttler_memory_usage_bytes` - Service memory usage
+- `throttler_redis_latency_seconds` - Redis operation latency
 - `throttler_active_connections` - Current active HTTP connections
 
-### Health Check Metrics
-- `throttler_health_check_status` - Health check results
-  - Labels: `component` (redis/service), `status` (healthy/unhealthy)
-
-## Monitoring Setup
-
-### Prometheus Configuration
+## Prometheus Configuration
 
 Add the following job to your `prometheus.yml`:
 
@@ -49,118 +92,118 @@ scrape_configs:
     scrape_timeout: 10s
 ```
 
-### Grafana Dashboard
+## Grafana Dashboards
 
-Recommended dashboard panels:
+### Request Rate Panel
 
-1. **Request Rate Panel**
-   ```promql
-   rate(throttler_requests_total[5m])
-   ```
+```promql
+rate(throttler_requests_total[5m])
+```
 
-2. **Rate Limit Violations**
-   ```promql
-   increase(throttler_rate_limit_hits_total[1m])
-   ```
+### Rate Limit Violations
 
-3. **Response Time Percentiles**
-   ```promql
-   histogram_quantile(0.95, rate(throttler_request_duration_seconds_bucket[5m]))
-   histogram_quantile(0.50, rate(throttler_request_duration_seconds_bucket[5m]))
-   ```
+```promql
+increase(throttler_rate_limit_hits_total[1m])
+```
 
-4. **Redis Operations**
-   ```promql
-   rate(throttler_redis_operations_total[5m])
-   ```
+### Response Time Percentiles
 
-5. **Service Health**
-   ```promql
-   throttler_health_check_status
-   ```
+```promql
+histogram_quantile(0.95, rate(throttler_request_duration_seconds_bucket[5m]))
+histogram_quantile(0.50, rate(throttler_request_duration_seconds_bucket[5m]))
+```
+
+### Redis Operations
+
+```promql
+rate(throttler_redis_operations_total[5m])
+```
+
+### Redis Latency
+
+```promql
+histogram_quantile(0.99, rate(throttler_redis_latency_seconds_bucket[5m]))
+```
 
 ## Alerting Rules
 
 ### Critical Alerts
 
 ```yaml
-# Service Down
-- alert: ThrottlerServiceDown
-  expr: up{job="throttler"} == 0
-  for: 1m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Throttler service is down"
-    description: "Throttler service has been down for more than 1 minute"
+groups:
+  - name: throttler-critical
+    rules:
+      # Service Down
+      - alert: ThrottlerServiceDown
+        expr: up{job="throttler"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Throttler service is down"
+          description: "Throttler has been down for more than 1 minute"
 
-# High Error Rate
-- alert: ThrottlerHighErrorRate
-  expr: |
-    (
-      rate(throttler_requests_total{status!="allowed"}[5m]) /
-      rate(throttler_requests_total[5m])
-    ) > 0.1
-  for: 5m
-  labels:
-    severity: critical
-  annotations:
-    summary: "High error rate in throttler service"
-    description: "Error rate is {{ $value | humanizePercentage }} for 5 minutes"
-
-# Redis Connection Issues
-- alert: ThrottlerRedisConnectionFailure
-  expr: |
-    rate(throttler_redis_operations_total{status="error"}[5m]) > 0.1
-  for: 2m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Redis connection issues in throttler"
-    description: "Redis error rate: {{ $value }} operations/sec"
+      # Redis Connection Issues
+      - alert: ThrottlerRedisConnectionFailure
+        expr: |
+          rate(throttler_redis_operations_total{status="error"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis connection issues in throttler"
+          description: "Redis error rate: {{ $value }} operations/sec"
 ```
 
 ### Warning Alerts
 
 ```yaml
-# High Response Time
-- alert: ThrottlerHighLatency
-  expr: |
-    histogram_quantile(0.95,
-      rate(throttler_request_duration_seconds_bucket[5m])
-    ) > 0.5
-  for: 10m
-  labels:
-    severity: warning
-  annotations:
-    summary: "High latency in throttler service"
-    description: "95th percentile latency is {{ $value }}s"
+groups:
+  - name: throttler-warnings
+    rules:
+      # High Response Time
+      - alert: ThrottlerHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(throttler_request_duration_seconds_bucket[5m])
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency in throttler service"
+          description: "95th percentile latency is {{ $value }}s"
 
-# High Rate Limit Violations
-- alert: ThrottlerHighRateLimitViolations
-  expr: |
-    rate(throttler_rate_limit_hits_total[5m]) > 10
-  for: 5m
-  labels:
-    severity: warning
-  annotations:
-    summary: "High rate limit violations"
-    description: "Rate limit violations: {{ $value }} per second"
-
-# Memory Usage
-- alert: ThrottlerHighMemoryUsage
-  expr: throttler_memory_usage_bytes > 1e9  # 1GB
-  for: 15m
-  labels:
-    severity: warning
-  annotations:
-    summary: "High memory usage in throttler"
-    description: "Memory usage: {{ $value | humanizeBytes }}"
+      # High Rate Limit Violations
+      - alert: ThrottlerHighRateLimitViolations
+        expr: |
+          rate(throttler_rate_limit_hits_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate limit violations"
+          description: "Rate limit violations: {{ $value }} per second"
 ```
 
-## Log Analysis
+## Logging
 
-### Log Levels and Structure
+### Log Configuration
+
+Set log level via environment variable:
+
+```bash
+# Available levels: error, warn, info, debug, trace
+RUST_LOG=info cargo run
+
+# Debug logging for throttler only
+RUST_LOG=throttler=debug cargo run
+
+# Verbose logging including dependencies
+RUST_LOG=debug cargo run
+```
+
+### Log Format
 
 The service uses structured JSON logging:
 
@@ -168,41 +211,89 @@ The service uses structured JSON logging:
 {
   "timestamp": "2024-01-15T10:30:45Z",
   "level": "INFO",
-  "message": "Request processed",
-  "client_id": "client123",
-  "endpoint": "/api/check",
-  "duration_ms": 23,
-  "status": "allowed"
+  "target": "throttler::handlers",
+  "message": "Rate limit check",
+  "key": "api-key-123",
+  "allowed": true,
+  "remaining": 99,
+  "duration_ms": 2
 }
 ```
 
-### Key Log Patterns
+### Log Analysis
 
 #### Rate Limit Violations
+
 ```bash
 # Search for rate limit denials
-grep '"status":"denied"' throttler.log | jq .
+grep '"allowed":false' throttler.log | jq .
 
-# Count violations by client
-grep '"status":"denied"' throttler.log | jq -r .client_id | sort | uniq -c
+# Count violations by key
+grep '"allowed":false' throttler.log | jq -r .key | sort | uniq -c | sort -rn
 ```
 
 #### Performance Issues
-```bash
-# Find slow requests (>1000ms)
-grep '"duration_ms"' throttler.log | jq 'select(.duration_ms > 1000)'
 
-# Average response time by endpoint
-grep '"duration_ms"' throttler.log | jq -r '[.endpoint, .duration_ms] | @csv'
+```bash
+# Find slow requests (>100ms)
+grep 'duration_ms' throttler.log | jq 'select(.duration_ms > 100)'
+
+# Average response time
+grep 'duration_ms' throttler.log | jq '.duration_ms' | awk '{sum+=$1; count++} END {print sum/count}'
 ```
 
-#### Error Analysis
+#### Redis Errors
+
 ```bash
-# Redis connection errors
+# Find Redis connection errors
 grep -i "redis.*error" throttler.log
 
-# Configuration errors
-grep '"level":"ERROR"' throttler.log | jq 'select(.message | contains("config"))'
+# Redis operation failures
+grep '"status":"error"' throttler.log | jq .
+```
+
+## Docker Compose Monitoring
+
+### View Container Logs
+
+```bash
+# All services
+docker compose logs -f
+
+# Redis only
+docker compose logs -f redis
+
+# Last 100 lines
+docker compose logs --tail=100
+```
+
+### Container Health
+
+```bash
+# Check container status
+docker compose ps
+
+# Detailed container info
+docker inspect throttler-redis
+```
+
+### Redis Monitoring
+
+```bash
+# Connect to Redis CLI
+docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD
+
+# Real-time command monitoring
+MONITOR
+
+# Memory usage
+INFO memory
+
+# Connected clients
+INFO clients
+
+# Key statistics
+INFO keyspace
 ```
 
 ## Performance Tuning
@@ -211,56 +302,38 @@ grep '"level":"ERROR"' throttler.log | jq 'select(.message | contains("config"))
 
 1. **Request Throughput**: Requests per second handled
 2. **Response Time**: P50, P95, P99 latencies
-3. **Memory Usage**: Steady-state and peak memory consumption
-4. **Redis Performance**: Operation latency and error rates
+3. **Redis Latency**: Operation latency distribution
+4. **Error Rate**: Failed requests percentage
 
 ### Optimization Guidelines
 
-#### Memory Optimization
-- Monitor token bucket memory usage
-- Tune Redis connection pool size
-- Set appropriate cleanup intervals
+#### Redis Connection Pool
 
-#### Network Optimization
-- Use Redis pipelining for batch operations
-- Optimize serialization format
-- Configure appropriate timeouts
-
-#### Capacity Planning
-- Monitor CPU and memory trends
-- Plan for traffic spikes
-- Set up horizontal scaling triggers
-
-## Troubleshooting Common Issues
-
-### Service Startup Issues
-```bash
-# Check configuration validation
-docker logs throttler-service | grep -i "config"
-
-# Verify Redis connectivity
-docker logs throttler-service | grep -i "redis"
+```env
+# Increase for high-load scenarios
+REDIS_MAX_CONNECTIONS=50
+REDIS_CONNECTION_TIMEOUT=5
 ```
 
-### High Latency Investigation
-1. Check Redis response times
-2. Monitor garbage collection metrics
-3. Analyze request distribution patterns
-4. Review connection pool utilization
+#### Memory Management
 
-### Memory Leaks
-1. Monitor heap growth over time
-2. Check for uncleaned token buckets
-3. Analyze Redis connection lifecycle
-4. Review cleanup job effectiveness
+Monitor Redis memory usage:
+
+```bash
+docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD INFO memory
+```
+
+Redis configuration (`docker/redis/redis.conf`):
+- `maxmemory 256mb` - Memory limit
+- `maxmemory-policy allkeys-lru` - Eviction policy
 
 ## Production Checklist
 
+- [ ] Health endpoints accessible
 - [ ] Prometheus scraping configured
 - [ ] Grafana dashboards deployed
 - [ ] Critical alerts configured
-- [ ] Log aggregation setup
+- [ ] Log aggregation set up
+- [ ] Redis Commander disabled (dev only)
 - [ ] Performance baselines established
 - [ ] Runbook documentation complete
-- [ ] On-call procedures defined
-- [ ] Capacity planning completed

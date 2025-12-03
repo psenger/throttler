@@ -1,35 +1,50 @@
 # Usage Examples
 
-## Basic Setup
+## Quick Start
 
 ### 1. Start the Service
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/throttler
+git clone <repository-url>
 cd throttler
 
 # Set up environment
 cp .env.example .env
+# Edit .env and set DOCKER_REDIS_PASSWORD
 
-# Start Redis (using Docker)
-docker run -d -p 6379:6379 redis:alpine
+# Start Redis with Docker Compose
+docker compose up -d
 
 # Build and run
 cargo run
 ```
 
-### 2. Create a Rate Limit Policy
+### 2. Verify Service is Running
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/rate-limits \
+# Health check
+curl http://localhost:8080/health
+
+# Readiness check (verifies Redis connection)
+curl http://localhost:8080/ready
+```
+
+### 3. Basic Rate Limiting
+
+```bash
+# Set up rate limit: 10 requests per minute
+curl -X POST http://localhost:8080/rate-limit/my-api-key \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "user_123",
-    "requests_per_second": 5,
-    "burst_size": 10,
-    "window_size_seconds": 60
-  }'
+  -d '{"requests": 10, "window_ms": 60000}'
+
+# Check rate limit (consume 1 token)
+curl -X POST http://localhost:8080/rate-limit/my-api-key/check \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Get current status
+curl http://localhost:8080/rate-limit/my-api-key
 ```
 
 ## Integration Examples
@@ -43,59 +58,62 @@ import time
 class ThrottlerClient:
     def __init__(self, base_url="http://localhost:8080"):
         self.base_url = base_url
-    
-    def create_rate_limit(self, key, rps, burst_size, window_size):
-        """Create a new rate limiting policy"""
+
+    def set_rate_limit(self, key, requests_per_window, window_ms):
+        """Configure rate limit for a key"""
         response = requests.post(
-            f"{self.base_url}/api/v1/rate-limits",
+            f"{self.base_url}/rate-limit/{key}",
             json={
-                "key": key,
-                "requests_per_second": rps,
-                "burst_size": burst_size,
-                "window_size_seconds": window_size
+                "requests": requests_per_window,
+                "window_ms": window_ms
             }
         )
         return response.json()
-    
-    def check_throttle(self, key, client_id=None, endpoint=None):
-        """Check if request should be throttled"""
-        data = {"key": key}
-        if client_id:
-            data["client_id"] = client_id
-        if endpoint:
-            data["endpoint"] = endpoint
-            
+
+    def check_rate_limit(self, key, tokens=1):
+        """Check if request is allowed and consume tokens"""
         response = requests.post(
-            f"{self.base_url}/api/v1/throttle",
-            json=data
+            f"{self.base_url}/rate-limit/{key}/check",
+            json={"tokens": tokens}
         )
+
+        # Include headers in response
+        result = response.json()
+        result["headers"] = {
+            "X-RateLimit-Limit": response.headers.get("X-RateLimit-Limit"),
+            "X-RateLimit-Remaining": response.headers.get("X-RateLimit-Remaining"),
+            "X-RateLimit-Reset": response.headers.get("X-RateLimit-Reset"),
+        }
+        return result
+
+    def get_status(self, key):
+        """Get current rate limit status"""
+        response = requests.get(f"{self.base_url}/rate-limit/{key}")
         return response.json()
-    
-    def get_metrics(self):
-        """Get service metrics"""
-        response = requests.get(f"{self.base_url}/api/v1/metrics")
+
+    def health_check(self):
+        """Check service health"""
+        response = requests.get(f"{self.base_url}/health")
         return response.json()
 
 # Usage example
 client = ThrottlerClient()
 
-# Create rate limit
-rate_limit = client.create_rate_limit(
-    key="api_user_456",
-    rps=10,
-    burst_size=20,
-    window_size=60
-)
-print(f"Created rate limit: {rate_limit['id']}")
+# Verify service is running
+print("Health:", client.health_check())
 
-# Test throttling
-for i in range(15):
-    result = client.check_throttle("api_user_456", client_id="web_client")
-    if result["allowed"]:
-        print(f"Request {i+1}: Allowed ({result['remaining']} remaining)")
+# Configure rate limit: 5 requests per minute
+client.set_rate_limit("api_user_123", requests_per_window=5, window_ms=60000)
+
+# Test rate limiting
+for i in range(7):
+    result = client.check_rate_limit("api_user_123")
+    if result.get("allowed", True):
+        print(f"Request {i+1}: Allowed (remaining: {result['headers']['X-RateLimit-Remaining']})")
     else:
-        print(f"Request {i+1}: Throttled (retry after {result['retry_after']}s)")
-        time.sleep(result['retry_after'])
+        retry_after = result.get("retry_after_seconds", 0)
+        print(f"Request {i+1}: Throttled (retry after {retry_after}s)")
+        time.sleep(retry_after)
 ```
 
 ### JavaScript/Node.js Client
@@ -108,27 +126,42 @@ class ThrottlerClient {
     this.client = axios.create({ baseURL });
   }
 
-  async createRateLimit(key, requestsPerSecond, burstSize, windowSize) {
-    const response = await this.client.post('/api/v1/rate-limits', {
-      key,
-      requests_per_second: requestsPerSecond,
-      burst_size: burstSize,
-      window_size_seconds: windowSize
+  async setRateLimit(key, requests, windowMs) {
+    const response = await this.client.post(`/rate-limit/${key}`, {
+      requests,
+      window_ms: windowMs
     });
     return response.data;
   }
 
-  async checkThrottle(key, clientId = null, endpoint = null) {
-    const data = { key };
-    if (clientId) data.client_id = clientId;
-    if (endpoint) data.endpoint = endpoint;
-    
-    const response = await this.client.post('/api/v1/throttle', data);
+  async checkRateLimit(key, tokens = 1) {
+    try {
+      const response = await this.client.post(`/rate-limit/${key}/check`, { tokens });
+      return {
+        allowed: true,
+        remaining: response.headers['x-ratelimit-remaining'],
+        resetTime: response.headers['x-ratelimit-reset'],
+        data: response.data
+      };
+    } catch (error) {
+      if (error.response?.status === 429) {
+        return {
+          allowed: false,
+          retryAfter: error.response.headers['retry-after'],
+          data: error.response.data
+        };
+      }
+      throw error;
+    }
+  }
+
+  async getStatus(key) {
+    const response = await this.client.get(`/rate-limit/${key}`);
     return response.data;
   }
 
-  async getMetrics() {
-    const response = await this.client.get('/api/v1/metrics');
+  async healthCheck() {
+    const response = await this.client.get('/health');
     return response.data;
   }
 }
@@ -136,41 +169,27 @@ class ThrottlerClient {
 // Usage example
 (async () => {
   const throttler = new ThrottlerClient();
-  
+
   try {
-    // Create rate limit
-    const rateLimit = await throttler.createRateLimit(
-      'mobile_app_789',
-      15,  // 15 requests per second
-      30,  // burst size of 30
-      60   // 60 second window
-    );
-    console.log('Created rate limit:', rateLimit.id);
-    
+    // Check health
+    console.log('Health:', await throttler.healthCheck());
+
+    // Configure rate limit
+    await throttler.setRateLimit('mobile_app_789', 10, 60000);
+
     // Test multiple requests
-    for (let i = 0; i < 20; i++) {
-      const result = await throttler.checkThrottle(
-        'mobile_app_789',
-        'ios_client_v2',
-        '/api/data'
-      );
-      
+    for (let i = 0; i < 12; i++) {
+      const result = await throttler.checkRateLimit('mobile_app_789');
+
       if (result.allowed) {
-        console.log(`Request ${i+1}: ✅ Allowed (${result.remaining} remaining)`);
-        // Simulate API call
-        await new Promise(resolve => setTimeout(resolve, 100));
+        console.log(`Request ${i+1}: Allowed (${result.remaining} remaining)`);
       } else {
-        console.log(`Request ${i+1}: ❌ Throttled (retry after ${result.retry_after}s)`);
-        await new Promise(resolve => setTimeout(resolve, result.retry_after * 1000));
+        console.log(`Request ${i+1}: Throttled (retry after ${result.retryAfter}s)`);
+        await new Promise(resolve => setTimeout(resolve, result.retryAfter * 1000));
       }
     }
-    
-    // Get final metrics
-    const metrics = await throttler.getMetrics();
-    console.log('Final metrics:', metrics);
-    
   } catch (error) {
-    console.error('Error:', error.response?.data || error.message);
+    console.error('Error:', error.message);
   }
 })();
 ```
@@ -181,39 +200,36 @@ class ThrottlerClient {
 const express = require('express');
 const axios = require('axios');
 
-// Throttling middleware
 function createThrottleMiddleware(throttlerUrl = 'http://localhost:8080') {
   return async (req, res, next) => {
     try {
-      // Extract key from API key header or IP address
+      // Use API key from header or fall back to IP
       const key = req.headers['x-api-key'] || req.ip;
-      
-      const response = await axios.post(`${throttlerUrl}/api/v1/throttle`, {
-        key,
-        client_id: req.headers['user-agent'],
-        endpoint: req.path
-      });
-      
-      const result = response.data;
-      
-      // Add rate limit headers
+
+      const response = await axios.post(
+        `${throttlerUrl}/rate-limit/${encodeURIComponent(key)}/check`,
+        { tokens: 1 }
+      );
+
+      // Forward rate limit headers
       res.set({
-        'X-RateLimit-Remaining': result.remaining,
-        'X-RateLimit-Reset': result.reset_time
+        'X-RateLimit-Limit': response.headers['x-ratelimit-limit'],
+        'X-RateLimit-Remaining': response.headers['x-ratelimit-remaining'],
+        'X-RateLimit-Reset': response.headers['x-ratelimit-reset']
       });
-      
-      if (result.allowed) {
-        next();
-      } else {
-        res.set('Retry-After', result.retry_after);
-        res.status(429).json({
+
+      next();
+    } catch (error) {
+      if (error.response?.status === 429) {
+        res.set('Retry-After', error.response.headers['retry-after']);
+        return res.status(429).json({
           error: 'Too Many Requests',
-          retry_after: result.retry_after
+          retry_after: error.response.headers['retry-after']
         });
       }
-    } catch (error) {
+
+      // Fail open - allow request if throttler is unavailable
       console.error('Throttle check failed:', error.message);
-      // Fail open - allow request if throttler is down
       next();
     }
   };
@@ -222,10 +238,9 @@ function createThrottleMiddleware(throttlerUrl = 'http://localhost:8080') {
 // Express app setup
 const app = express();
 
-// Apply throttling middleware
+// Apply throttling middleware to API routes
 app.use('/api', createThrottleMiddleware());
 
-// API routes
 app.get('/api/users', (req, res) => {
   res.json({ users: ['Alice', 'Bob', 'Charlie'] });
 });
@@ -239,72 +254,145 @@ app.listen(3000, () => {
 });
 ```
 
-## Docker Compose Example
+## Docker Compose Development Setup
 
-```yaml
-# docker-compose.yml
-version: '3.8'
+The project includes a complete Docker Compose setup for local development:
 
-services:
-  throttler:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=info
-      - PORT=8080
-    depends_on:
-      - redis
-    restart: unless-stopped
+```bash
+# Start Redis and Redis Commander
+docker compose up -d
 
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
+# View Redis data in browser
+open http://localhost:8081
 
-  app:
-    build:
-      context: ./example-app
-    ports:
-      - "3000:3000"
-    environment:
-      - THROTTLER_URL=http://throttler:8080
-    depends_on:
-      - throttler
-    restart: unless-stopped
-
-volumes:
-  redis_data:
+# Run the throttler service
+cargo run
 ```
 
-## Load Testing Example
+### Inspecting Redis State
+
+Use Redis Commander at http://localhost:8081 to:
+- View all rate limit keys
+- Inspect token bucket state
+- Monitor key expiration
+- Debug rate limiting behavior
+
+### Using redis-cli
+
+```bash
+# Connect to Redis with password
+docker exec -it throttler-redis redis-cli -a $DOCKER_REDIS_PASSWORD
+
+# List all throttler keys
+KEYS throttler:*
+
+# Inspect a specific key
+GET throttler:rate_limit:my-api-key
+
+# Monitor all Redis commands in real-time
+MONITOR
+```
+
+## Load Testing
+
+### Simple Burst Test
 
 ```bash
 #!/bin/bash
-# load_test.sh
+# burst_test.sh
 
-# Create rate limit policy
-curl -X POST http://localhost:8080/api/v1/rate-limits \
+KEY="load-test-key"
+REQUESTS=100
+
+echo "Sending $REQUESTS requests..."
+
+for i in $(seq 1 $REQUESTS); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST http://localhost:8080/rate-limit/$KEY/check \
+    -H "Content-Type: application/json" \
+    -d '{}')
+
+  if [ "$STATUS" = "200" ]; then
+    echo -n "."
+  else
+    echo -n "X"
+  fi
+done
+
+echo ""
+echo "Done!"
+```
+
+### Using Apache Bench
+
+```bash
+# Create request payload
+echo '{}' > /tmp/throttle_request.json
+
+# Run load test: 1000 requests, 50 concurrent
+ab -n 1000 -c 50 \
+   -H "Content-Type: application/json" \
+   -p /tmp/throttle_request.json \
+   http://localhost:8080/rate-limit/ab-test/check
+```
+
+### Using wrk
+
+```lua
+-- throttle_test.lua
+wrk.method = "POST"
+wrk.body   = "{}"
+wrk.headers["Content-Type"] = "application/json"
+```
+
+```bash
+# Run 30-second load test with 4 threads and 50 connections
+wrk -t4 -c50 -d30s -s throttle_test.lua \
+    http://localhost:8080/rate-limit/wrk-test/check
+```
+
+## Common Patterns
+
+### Per-User Rate Limiting
+
+```bash
+# Each user gets their own rate limit
+for user in user1 user2 user3; do
+  curl -X POST "http://localhost:8080/rate-limit/$user" \
+    -H "Content-Type: application/json" \
+    -d '{"requests": 100, "window_ms": 60000}'
+done
+```
+
+### Tiered Rate Limits
+
+```bash
+# Free tier: 10 requests/minute
+curl -X POST http://localhost:8080/rate-limit/free:user123 \
   -H "Content-Type: application/json" \
-  -d '{
-    "key": "load_test",
-    "requests_per_second": 100,
-    "burst_size": 200,
-    "window_size_seconds": 60
-  }'
+  -d '{"requests": 10, "window_ms": 60000}'
 
-# Run load test with different tools
+# Pro tier: 100 requests/minute
+curl -X POST http://localhost:8080/rate-limit/pro:user456 \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 100, "window_ms": 60000}'
 
-# Using Apache Bench
-ab -n 1000 -c 50 -H "Content-Type: application/json" \
-   -p throttle_request.json \
-   http://localhost:8080/api/v1/throttle
+# Enterprise tier: 1000 requests/minute
+curl -X POST http://localhost:8080/rate-limit/enterprise:user789 \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 1000, "window_ms": 60000}'
+```
 
-# Using wrk
-wrk -t4 -c50 -d30s -s throttle_script.lua http://localhost:8080/api/v1/throttle
+### Endpoint-Specific Limits
+
+```bash
+# Stricter limit for expensive operations
+curl -X POST http://localhost:8080/rate-limit/user123:export \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 5, "window_ms": 3600000}'  # 5 per hour
+
+# Normal limit for regular API calls
+curl -X POST http://localhost:8080/rate-limit/user123:api \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 100, "window_ms": 60000}'  # 100 per minute
 ```
