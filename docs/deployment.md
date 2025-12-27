@@ -1,6 +1,18 @@
 # Deployment Guide
 
-This guide covers various deployment scenarios for the throttler service.
+Complete guide to deploying Throttler in development and production environments.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Local Development](#local-development)
+- [Docker Compose Reference](#docker-compose-reference)
+- [Environment Variables](#environment-variables)
+- [Production Deployment](#production-deployment)
+- [Kubernetes Deployment](#kubernetes-deployment)
+- [Production Considerations](#production-considerations)
+
+---
 
 ## Prerequisites
 
@@ -122,17 +134,17 @@ docker compose restart redis
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `THROTTLER_HOST` | `127.0.0.1` | Server host |
-| `THROTTLER_PORT` | `8080` | Server port |
-| `DOCKER_REDIS_PASSWORD` | - | Redis password (required) |
-| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL |
-| `REDIS_MAX_CONNECTIONS` | `10` | Redis connection pool size |
-| `REDIS_CONNECTION_TIMEOUT` | `5` | Connection timeout (seconds) |
-| `DEFAULT_RATE_LIMIT_CAPACITY` | `100` | Default bucket capacity |
-| `DEFAULT_RATE_LIMIT_REFILL` | `10` | Default refill rate |
-| `RUST_LOG` | `info` | Log level |
+| Variable                      | Default                  | Description                  |
+|-------------------------------|--------------------------|------------------------------|
+| `THROTTLER_HOST`              | `127.0.0.1`              | Server host                  |
+| `THROTTLER_PORT`              | `8080`                   | Server port                  |
+| `DOCKER_REDIS_PASSWORD`       | -                        | Redis password (required)    |
+| `REDIS_URL`                   | `redis://127.0.0.1:6379` | Redis connection URL         |
+| `REDIS_MAX_CONNECTIONS`       | `10`                     | Redis connection pool size   |
+| `REDIS_CONNECTION_TIMEOUT`    | `5`                      | Connection timeout (seconds) |
+| `DEFAULT_RATE_LIMIT_CAPACITY` | `100`                    | Default bucket capacity      |
+| `DEFAULT_RATE_LIMIT_REFILL`   | `10`                     | Default refill rate          |
+| `RUST_LOG`                    | `info`                   | Log level                    |
 
 ## Production Deployment
 

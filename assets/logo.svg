@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 512 512"
+   width="512"
+   height="512"
+   version="1.1"
+   id="svg20"
+   sodipodi:docname="logo.svg"
+   inkscape:version="1.4.2 (ebf0e940, 2025-05-08)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview20"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="0.64407282"
+     inkscape:cx="-17.078814"
+     inkscape:cy="259.28745"
+     inkscape:window-width="1512"
+     inkscape:window-height="949"
+     inkscape:window-x="0"
+     inkscape:window-y="33"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="svg20" />
+  <defs
+     id="defs4">
+    <linearGradient
+       id="mainGradient"
+       x1="0%"
+       y1="0%"
+       x2="100%"
+       y2="100%">
+      <stop
+         offset="0%"
+         style="stop-color:#FF6B35;stop-opacity:1"
+         id="stop1" />
+      <stop
+         offset="100%"
+         style="stop-color:#F7931E;stop-opacity:1"
+         id="stop2" />
+    </linearGradient>
+    <linearGradient
+       id="accentGradient"
+       x1="0%"
+       y1="0%"
+       x2="100%"
+       y2="100%">
+      <stop
+         offset="0%"
+         style="stop-color:#4ECDC4;stop-opacity:1"
+         id="stop3" />
+      <stop
+         offset="100%"
+         style="stop-color:#44A08D;stop-opacity:1"
+         id="stop4" />
+    </linearGradient>
+    <filter
+       id="shadow"
+       x="0"
+       y="0"
+       width="1"
+       height="1">
+      <feDropShadow
+         dx="0"
+         dy="4"
+         stdDeviation="8"
+         flood-color="#000000"
+         flood-opacity="0.15" />
+    </filter>
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#accentGradient"
+       id="linearGradient20"
+       x1="18.601155"
+       y1="2.7986348"
+       x2="352.57274"
+       y2="336.77022"
+       gradientTransform="matrix(1.0267385,0,0,0.97395785,63.657399,72.973115)"
+       gradientUnits="userSpaceOnUse" />
+  </defs>
+  <circle
+     cx="256"
+     cy="256"
+     r="240"
+     fill="url(#mainGradient)"
+     filter="url(#shadow)"
+     id="circle4" />
+  <circle
+     cx="256"
+     cy="256"
+     r="180"
+     fill="#1a1a2e"
+     id="circle5" />
+  <path
+     d="M 116 316 A 160 160 0 1 1 396 316"
+     fill="none"
+     stroke="#2d2d44"
+     stroke-width="24"
+     stroke-linecap="round"
+     id="path5" />
+  <path
+     d="m 179.6574,388.97312 a 160,160 0 1 1 234,-160"
+     fill="none"
+     stroke="url(#accentGradient)"
+     stroke-width="24"
+     stroke-linecap="round"
+     id="path6"
+     style="stroke:url(#linearGradient20)" />
+  <g
+     stroke="#4a4a5e"
+     stroke-width="3"
+     stroke-linecap="round"
+     id="g13">
+    <line
+       x1="130"
+       y1="300"
+       x2="150"
+       y2="285"
+       id="line6" />
+    <line
+       x1="170"
+       y1="360"
+       x2="185"
+       y2="340"
+       id="line7" />
+    <line
+       x1="256"
+       y1="400"
+       x2="256"
+       y2="375"
+       id="line8" />
+    <line
+       x1="342"
+       y1="360"
+       x2="327"
+       y2="340"
+       id="line9" />
+    <line
+       x1="382"
+       y1="300"
+       x2="362"
+       y2="285"
+       id="line10" />
+    <line
+       x1="382"
+       y1="212"
+       x2="362"
+       y2="227"
+       id="line11" />
+    <line
+       x1="256"
+       y1="112"
+       x2="256"
+       y2="137"
+       id="line12" />
+    <line
+       x1="130"
+       y1="212"
+       x2="150"
+       y2="227"
+       id="line13" />
+  </g>
+  <circle
+     cx="256"
+     cy="256"
+     r="40"
+     fill="#2d2d44"
+     id="circle13" />
+  <circle
+     cx="256"
+     cy="256"
+     r="28"
+     fill="url(#accentGradient)"
+     id="circle14" />
+  <g
+     transform="rotate(-30, 256, 256)"
+     id="g14">
+    <path
+       d="M 256 256 L 248 265 L 256 140 L 264 265 Z"
+       fill="#ffffff"
+       id="path14" />
+  </g>
+  <circle
+     cx="256"
+     cy="256"
+     r="12"
+     fill="#ffffff"
+     id="circle15" />
+</svg>

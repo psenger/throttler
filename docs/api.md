@@ -1,24 +1,47 @@
 # API Documentation
 
+Complete reference for the Throttler REST API.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Health Endpoints](#health-endpoints)
+- [Rate Limiting Endpoints](#rate-limiting-endpoints)
+- [Request/Response Format](#requestresponse-format)
+- [Error Handling](#error-handling)
+- [Rate Limit Headers](#rate-limit-headers)
+- [Examples](#examples)
+
+---
+
 ## Overview
 
-The Throttler service provides RESTful APIs for rate limiting and request throttling. All endpoints return JSON responses and support standard HTTP status codes.
+The Throttler service provides a RESTful API for rate limiting and request throttling. All endpoints accept and return JSON.
 
-## Base URL
-
+**Base URL:**
 ```
 http://localhost:8080
 ```
 
-## Endpoints
+**Content Type:**
+```
+Content-Type: application/json
+```
 
-### Health & Readiness
+---
 
-#### GET /health
+## Health Endpoints
 
-Returns the health status of the service.
+### GET /health
 
-**Response:**
+Liveness probe for container orchestrators.
+
+**Request:**
+```bash
+curl http://localhost:8080/health
+```
+
+**Response (200 OK):**
 ```json
 {
   "status": "healthy",
@@ -27,11 +50,16 @@ Returns the health status of the service.
 }
 ```
 
-#### GET /ready
+### GET /ready
 
-Returns the readiness status (checks Redis connectivity).
+Readiness probe that verifies Redis connectivity.
 
-**Response:**
+**Request:**
+```bash
+curl http://localhost:8080/ready
+```
+
+**Response (200 OK):**
 ```json
 {
   "status": "ready",
@@ -39,18 +67,28 @@ Returns the readiness status (checks Redis connectivity).
 }
 ```
 
-### Rate Limiting
+**Response (503 Service Unavailable):**
+```json
+{
+  "status": "not_ready",
+  "redis": "disconnected"
+}
+```
 
-#### GET /rate-limit/:key
+---
 
-Retrieve the rate limit configuration for a specific key.
+## Rate Limiting Endpoints
 
-**Example:**
+### GET /rate-limit/:key
+
+Retrieve the current rate limit configuration and status for a key.
+
+**Request:**
 ```bash
 curl http://localhost:8080/rate-limit/api-key-123
 ```
 
-**Response:**
+**Response (200 OK):**
 ```json
 {
   "key": "api-key-123",
@@ -61,7 +99,7 @@ curl http://localhost:8080/rate-limit/api-key-123
 }
 ```
 
-**Error Response (404):**
+**Response (404 Not Found):**
 ```json
 {
   "error": "not_found",
@@ -69,26 +107,26 @@ curl http://localhost:8080/rate-limit/api-key-123
 }
 ```
 
-#### POST /rate-limit/:key
+---
+
+### POST /rate-limit/:key
 
 Create or update a rate limit configuration.
 
 **Request Body:**
-```json
-{
-  "requests": 100,
-  "window_ms": 60000
-}
-```
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `requests` | integer | Yes | Maximum requests per window |
+| `window_ms` | integer | Yes | Window size in milliseconds |
 
-**Example:**
+**Request:**
 ```bash
 curl -X POST http://localhost:8080/rate-limit/api-key-123 \
   -H "Content-Type: application/json" \
   -d '{"requests": 100, "window_ms": 60000}'
 ```
 
-**Response:**
+**Response (200 OK):**
 ```json
 {
   "status": "success",
@@ -99,16 +137,26 @@ curl -X POST http://localhost:8080/rate-limit/api-key-123 \
 }
 ```
 
-#### DELETE /rate-limit/:key
+**Response (400 Bad Request):**
+```json
+{
+  "error": "validation_error",
+  "message": "requests must be between 1 and 10000"
+}
+```
+
+---
+
+### DELETE /rate-limit/:key
 
 Delete a rate limit configuration.
 
-**Example:**
+**Request:**
 ```bash
 curl -X DELETE http://localhost:8080/rate-limit/api-key-123
 ```
 
-**Response:**
+**Response (200 OK):**
 ```json
 {
   "status": "success",
@@ -117,28 +165,27 @@ curl -X DELETE http://localhost:8080/rate-limit/api-key-123
 }
 ```
 
-#### POST /rate-limit/:key/check
+---
 
-Check if a request should be allowed and consume tokens.
+### POST /rate-limit/:key/check
+
+Check if a request is allowed and consume tokens.
 
 **Request Body:**
-```json
-{
-  "key": "api-key-123",
-  "requests": 1,
-  "window_ms": 60000,
-  "headers": {}
-}
-```
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tokens` | integer | No | Tokens to consume (default: 1) |
+| `requests` | integer | No | Create if not exists |
+| `window_ms` | integer | No | Create if not exists |
 
-**Example:**
+**Request:**
 ```bash
 curl -X POST http://localhost:8080/rate-limit/api-key-123/check \
   -H "Content-Type: application/json" \
-  -d '{"requests": 1}'
+  -d '{"tokens": 1}'
 ```
 
-**Response (Allowed):**
+**Response (200 OK - Allowed):**
 ```json
 {
   "allowed": true,
@@ -155,7 +202,7 @@ X-RateLimit-Reset: 1705312260
 X-RateLimit-Window: 60000
 ```
 
-**Response (Rate Limited - 429):**
+**Response (429 Too Many Requests):**
 ```json
 {
   "error": "rate_limit_exceeded",
@@ -173,9 +220,47 @@ X-RateLimit-Limit: 100
 X-RateLimit-Window: 60000
 ```
 
-## Error Responses
+---
 
-All error responses follow this format:
+## Request/Response Format
+
+### Key Format
+
+Rate limit keys must follow these rules:
+
+| Rule | Value |
+|------|-------|
+| Allowed characters | `a-z`, `A-Z`, `0-9`, `-`, `_`, `:`, `.` |
+| Maximum length | 256 characters |
+| Minimum length | 1 character |
+
+**Valid Keys:**
+```
+user-123
+api_key:production
+tier:free:client-456
+my.service.endpoint
+```
+
+**Invalid Keys:**
+```
+key with spaces
+key/with/slashes
+key!with@special#chars
+```
+
+### Rate Limit Values
+
+| Field | Minimum | Maximum |
+|-------|---------|---------|
+| `requests` | 1 | 10,000 |
+| `window_ms` | 1,000 (1 second) | 86,400,000 (24 hours) |
+
+---
+
+## Error Handling
+
+All errors follow a consistent format:
 
 ```json
 {
@@ -189,12 +274,13 @@ All error responses follow this format:
 | Code | HTTP Status | Description |
 |------|-------------|-------------|
 | `validation_error` | 400 | Request validation failed |
-| `not_found` | 404 | Resource not found |
+| `invalid_key` | 400 | Key format is invalid |
+| `not_found` | 404 | Rate limit config not found |
 | `rate_limit_exceeded` | 429 | Too many requests |
 | `internal_error` | 500 | Server error |
-| `configuration_error` | 400 | Invalid configuration |
+| `redis_error` | 500 | Redis connection/operation failed |
 
-### Validation Errors
+### Validation Error Examples
 
 ```json
 {
@@ -203,56 +289,117 @@ All error responses follow this format:
 }
 ```
 
+```json
+{
+  "error": "validation_error",
+  "message": "requests must be between 1 and 10000"
+}
+```
+
+```json
+{
+  "error": "validation_error",
+  "message": "window_ms must be between 1000 and 86400000"
+}
+```
+
+---
+
 ## Rate Limit Headers
 
 All rate-limited responses include these headers:
 
-| Header | Description |
-|--------|-------------|
-| `X-RateLimit-Limit` | Maximum requests allowed |
-| `X-RateLimit-Remaining` | Remaining requests in window |
-| `X-RateLimit-Reset` | Unix timestamp when limit resets |
-| `X-RateLimit-Window` | Window size in milliseconds |
-| `Retry-After` | Seconds to wait (only on 429) |
+| Header | Description | Example |
+|--------|-------------|---------|
+| `X-RateLimit-Limit` | Maximum requests allowed | `100` |
+| `X-RateLimit-Remaining` | Remaining requests in window | `99` |
+| `X-RateLimit-Reset` | Unix timestamp when limit resets | `1705312260` |
+| `X-RateLimit-Window` | Window size in milliseconds | `60000` |
+| `Retry-After` | Seconds to wait (only on 429) | `30` |
 
-## Request Validation
-
-### Key Format
-- Must be alphanumeric with `-`, `_`, `:`, `.` allowed
-- Maximum length: 256 characters
-- Cannot be empty
-
-### Rate Limit Values
-- `requests`: Must be > 0 and <= 10000
-- `window_ms`: Must be >= 1000 and <= 86400000 (24 hours)
+---
 
 ## Examples
 
-### Basic Rate Limiting
+### Basic Rate Limiting Flow
 
 ```bash
-# Set up rate limit: 10 requests per minute
+# 1. Configure rate limit: 10 requests per minute
 curl -X POST http://localhost:8080/rate-limit/my-api-key \
   -H "Content-Type: application/json" \
   -d '{"requests": 10, "window_ms": 60000}'
 
-# Check rate limit (consume 1 token)
+# 2. Check rate limit (consume 1 token)
 curl -X POST http://localhost:8080/rate-limit/my-api-key/check \
   -H "Content-Type: application/json" \
   -d '{}'
 
-# Get current status
+# 3. Get current status
 curl http://localhost:8080/rate-limit/my-api-key
+
+# 4. Clean up
+curl -X DELETE http://localhost:8080/rate-limit/my-api-key
 ```
 
 ### Burst Testing
 
 ```bash
-# Send 15 rapid requests
+# Send 15 rapid requests to a 10-request limit
 for i in {1..15}; do
-  curl -s -o /dev/null -w "%{http_code}\n" \
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
     -X POST http://localhost:8080/rate-limit/burst-test/check \
     -H "Content-Type: application/json" \
-    -d '{"requests": 10, "window_ms": 60000}'
+    -d '{"requests": 10, "window_ms": 60000}')
+  echo "Request $i: $STATUS"
 done
 ```
+
+**Expected Output:**
+```
+Request 1: 200
+Request 2: 200
+...
+Request 10: 200
+Request 11: 429
+Request 12: 429
+...
+```
+
+### Tiered Rate Limits
+
+```bash
+# Free tier: 10 requests/minute
+curl -X POST http://localhost:8080/rate-limit/free:user123 \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 10, "window_ms": 60000}'
+
+# Pro tier: 100 requests/minute
+curl -X POST http://localhost:8080/rate-limit/pro:user456 \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 100, "window_ms": 60000}'
+
+# Enterprise tier: 1000 requests/minute
+curl -X POST http://localhost:8080/rate-limit/enterprise:user789 \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 1000, "window_ms": 60000}'
+```
+
+### Endpoint-Specific Limits
+
+```bash
+# Stricter limit for expensive operations (5 per hour)
+curl -X POST http://localhost:8080/rate-limit/user123:export \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 5, "window_ms": 3600000}'
+
+# Normal limit for regular API calls (100 per minute)
+curl -X POST http://localhost:8080/rate-limit/user123:api \
+  -H "Content-Type: application/json" \
+  -d '{"requests": 100, "window_ms": 60000}'
+```
+
+---
+
+## SDK Examples
+
+See [Usage Examples](examples.md) for Python, Node.js, and middleware integration examples.

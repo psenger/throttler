@@ -1,6 +1,20 @@
 # Troubleshooting Guide
 
-This guide covers common issues and their solutions when running the throttler service.
+Solutions for common issues when running the Throttler service.
+
+## Table of Contents
+
+- [Quick Diagnostics](#quick-diagnostics)
+- [Docker Compose Issues](#docker-compose-issues)
+- [Redis Connection Issues](#redis-connection-issues)
+- [Rate Limiting Issues](#rate-limiting-issues)
+- [Performance Issues](#performance-issues)
+- [Configuration Issues](#configuration-issues)
+- [Build Issues](#build-issues)
+- [Debugging Tips](#debugging-tips)
+- [Getting Help](#getting-help)
+
+---
 
 ## Quick Diagnostics
 

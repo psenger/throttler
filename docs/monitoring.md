@@ -1,6 +1,19 @@
 # Monitoring and Observability
 
-This guide covers monitoring, observability, and alerting for the throttler service.
+Complete guide to monitoring, observability, and alerting for the Throttler service.
+
+## Table of Contents
+
+- [Health Endpoints](#health-endpoints)
+- [Redis Commander](#redis-commander)
+- [Prometheus Metrics](#prometheus-metrics)
+- [Grafana Dashboards](#grafana-dashboards)
+- [Alerting Rules](#alerting-rules)
+- [Logging](#logging)
+- [Docker Monitoring](#docker-compose-monitoring)
+- [Performance Tuning](#performance-tuning)
+
+---
 
 ## Health Endpoints
 
