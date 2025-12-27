@@ -1,3 +1,45 @@
+//! # Error Types and Handling
+//!
+//! This module defines the custom error types for Throttler and their
+//! automatic conversion to HTTP responses.
+//!
+//! ## Error to HTTP Status Mapping
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │                    Error → HTTP Status Mapping                          │
+//! ├─────────────────────────────────────────────────────────────────────────┤
+//! │                                                                         │
+//! │  ThrottlerError Variant      │  HTTP Status        │  Response Type    │
+//! │  ────────────────────────────┼─────────────────────┼───────────────────│
+//! │  RateLimitExceeded           │  429 Too Many Reqs  │  + Retry-After    │
+//! │  ValidationError             │  400 Bad Request    │  JSON error       │
+//! │  InvalidKey                  │  400 Bad Request    │  JSON error       │
+//! │  ConfigError                 │  400 Bad Request    │  JSON error       │
+//! │  RedisError                  │  500 Internal Error │  Generic error    │
+//! │  SerializationError          │  500 Internal Error │  Generic error    │
+//! │  InternalError               │  500 Internal Error │  Generic error    │
+//! │                                                                         │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Automatic Conversions
+//!
+//! The error type implements `From` for automatic conversion:
+//! - `redis::RedisError` → `ThrottlerError::RedisError`
+//! - `serde_json::Error` → `ThrottlerError::SerializationError`
+//!
+//! ## Axum Integration
+//!
+//! Implements `IntoResponse` for seamless use with Axum handlers:
+//!
+//! ```rust,ignore
+//! async fn handler() -> Result<impl IntoResponse, ThrottlerError> {
+//!     // Errors automatically convert to appropriate HTTP responses
+//!     Err(ThrottlerError::ValidationError("Invalid key".to_string()))
+//! }
+//! ```
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -5,18 +47,62 @@ use axum::{
 };
 use std::fmt;
 
+/// Custom error type for all Throttler operations.
+///
+/// This enum represents all possible errors that can occur in the Throttler
+/// service. Each variant automatically maps to an appropriate HTTP status
+/// code when converted to an Axum response.
+///
+/// # Example
+///
+/// ```rust
+/// use throttler::error::ThrottlerError;
+///
+/// // Create a validation error
+/// let err = ThrottlerError::ValidationError("Key too long".to_string());
+///
+/// // Create a rate limit error
+/// let err = ThrottlerError::RateLimitExceeded {
+///     retry_after: 60,
+///     limit: 100,
+///     window_ms: 60000,
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub enum ThrottlerError {
+    /// Redis operation failed (connection, command, etc.)
+    /// Maps to: 500 Internal Server Error
     RedisError(String),
+
+    /// Configuration is invalid or missing
+    /// Maps to: 400 Bad Request
     ConfigError(String),
+
+    /// Request validation failed (parameters out of range, etc.)
+    /// Maps to: 400 Bad Request
     ValidationError(String),
+
+    /// Rate limit was exceeded for the requested key
+    /// Maps to: 429 Too Many Requests (with Retry-After header)
     RateLimitExceeded {
+        /// Seconds until more tokens are available
         retry_after: u64,
+        /// Maximum allowed requests
         limit: u64,
+        /// Window size in milliseconds
         window_ms: u64,
     },
+
+    /// Unexpected internal error
+    /// Maps to: 500 Internal Server Error
     InternalError(String),
+
+    /// Rate limit key format is invalid
+    /// Maps to: 400 Bad Request
     InvalidKey(String),
+
+    /// JSON serialization/deserialization failed
+    /// Maps to: 500 Internal Server Error
     SerializationError(String),
 }
 

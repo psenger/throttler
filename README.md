@@ -267,16 +267,17 @@ await throttler.setRateLimit(
 
 ## Documentation
 
-| Resource                                      | Description                               |
-|-----------------------------------------------|-------------------------------------------|
-| [API Documentation](docs/api.md)              | Complete endpoint reference with examples |
-| [Architecture Overview](docs/architecture.md) | System design and component details       |
-| [Deployment Guide](docs/deployment.md)        | Docker, Kubernetes, and production setup  |
-| [Usage Examples](docs/examples.md)            | Python, Node.js, and middleware examples  |
-| [Monitoring Guide](docs/monitoring.md)        | Prometheus, Grafana, and alerting         |
-| [Troubleshooting](docs/troubleshooting.md)    | Common issues and solutions               |
-| [Contributing](CONTRIBUTING.md)               | Guidelines for contributors               |
-| [Changelog](CHANGELOG.md)                     | Version history and release notes         |
+| Resource                                       | Description                               |
+|------------------------------------------------|-------------------------------------------|
+| [API Documentation](docs/api.md)               | Complete endpoint reference with examples |
+| [Architecture Overview](docs/architecture.md)  | System design and component details       |
+| [Code Architecture](docs/code-architecture.md) | Code structure, diagrams, and data flow   |
+| [Deployment Guide](docs/deployment.md)         | Docker, Kubernetes, and production setup  |
+| [Usage Examples](docs/examples.md)             | Python, Node.js, and middleware examples  |
+| [Monitoring Guide](docs/monitoring.md)         | Prometheus, Grafana, and alerting         |
+| [Troubleshooting](docs/troubleshooting.md)     | Common issues and solutions               |
+| [Contributing](CONTRIBUTING.md)                | Guidelines for contributors               |
+| [Changelog](CHANGELOG.md)                      | Version history and release notes         |
 
 ---
 

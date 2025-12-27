@@ -1,3 +1,65 @@
+//! # Rate Limiter Engine
+//!
+//! The core rate limiting engine that manages token buckets and provides
+//! the primary rate limiting logic for the Throttler service.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │                          RateLimiter                           │
+//! ├────────────────────────────────────────────────────────────────┤
+//! │                                                                │
+//! │  ┌──────────────────────────────────────────────────────────┐  │
+//! │  │                    Storage Layer                         │  │
+//! │  │                                                          │  │
+//! │  │   Local Mode:              Distributed Mode:             │  │
+//! │  │   ┌─────────────────┐      ┌─────────────────┐           │  │
+//! │  │   │ HashMap<String, │      │  Redis Server   │           │  │
+//! │  │   │   LocalBucket>  │      │                 │           │  │
+//! │  │   │                 │      │  KEY: bucket:x  │           │  │
+//! │  │   │  In-memory,     │      │  VAL: {tokens,  │           │  │
+//! │  │   │  single process │      │       capacity} │           │  │
+//! │  │   └─────────────────┘      └─────────────────┘           │  │
+//! │  │                                                          │  │
+//! │  └──────────────────────────────────────────────────────────┘  │
+//! │                                                                │
+//! │  Token Bucket Algorithm:                                       │
+//! │  ┌─────────────────────────────────────────────────────────┐   │
+//! │  │  1. Calculate elapsed time since last refill            │   │
+//! │  │  2. Add tokens: new_tokens = elapsed_sec × refill_rate  │   │
+//! │  │  3. Cap tokens at capacity                              │   │
+//! │  │  4. If tokens >= 1: consume and allow                   │   │
+//! │  │  5. If tokens < 1: deny request                         │   │
+//! │  └─────────────────────────────────────────────────────────┘   │
+//! │                                                                │
+//! └────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Thread Safety
+//!
+//! The `RateLimiter` uses `Arc<RwLock<HashMap>>` for the local bucket store,
+//! allowing concurrent read access with exclusive write access for modifications.
+//!
+//! ## Usage
+//!
+//! ```rust,no_run
+//! use throttler::config::Config;
+//! use throttler::rate_limiter::RateLimiter;
+//!
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = Config::from_env()?;
+//! let limiter = RateLimiter::new(config)?;
+//!
+//! // Check rate limit (consumes 1 token)
+//! let (allowed, remaining) = limiter.check_rate_limit("client-123")?;
+//! if !allowed {
+//!     println!("Rate limit exceeded! Retry later.");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,19 +67,66 @@ use crate::config::Config;
 use crate::error::ThrottlerError;
 use crate::redis::RedisClient;
 
+/// Core rate limiting engine using the token bucket algorithm.
+///
+/// The `RateLimiter` manages token buckets for each unique key and provides
+/// thread-safe rate limiting operations. It supports both local (in-memory)
+/// and distributed (Redis-backed) storage modes.
+///
+/// # Token Bucket Algorithm
+///
+/// Each key has an associated bucket that:
+/// - Starts with `capacity` tokens
+/// - Refills at `refill_rate` tokens per second
+/// - Never exceeds `capacity` tokens
+/// - Consumes 1 token per successful request
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use throttler::config::Config;
+/// use throttler::rate_limiter::RateLimiter;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config::from_env()?;
+/// let limiter = RateLimiter::new(config)?;
+///
+/// // Check and consume tokens
+/// let (allowed, remaining) = limiter.check_rate_limit("api-key-123")?;
+/// println!("Allowed: {}, Remaining: {}", allowed, remaining);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct RateLimiter {
+    /// Application configuration (capacity, refill rate, etc.)
     config: Arc<Config>,
+    /// In-memory token buckets for local mode
     local_buckets: Arc<RwLock<HashMap<String, LocalBucket>>>,
+    /// Optional Redis client for distributed mode
     redis_client: Option<Arc<RedisClient>>,
 }
 
-/// Local bucket state for in-memory rate limiting
+/// Local (in-memory) token bucket state.
+///
+/// Stores the current state of a token bucket for a specific key.
+/// Used when Redis is not configured or as a fallback.
+///
+/// # Fields
+///
+/// * `tokens` - Current token count (fractional for precise refill)
+/// * `capacity` - Maximum tokens the bucket can hold
+/// * `refill_rate` - Tokens added per second
+/// * `last_refill` - Timestamp of last refill calculation (ms since epoch)
 #[derive(Clone)]
 struct LocalBucket {
+    /// Current number of tokens (fractional for precise calculation)
     tokens: f64,
+    /// Maximum bucket capacity
     capacity: u64,
+    /// Tokens added per second
     refill_rate: f64,
+    /// Timestamp of last refill (milliseconds since UNIX epoch)
     last_refill: u64,
 }
 

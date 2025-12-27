@@ -1,9 +1,91 @@
+//! # Redis Client for Distributed Rate Limiting
+//!
+//! This module provides a Redis client wrapper for storing token bucket
+//! state in a distributed environment. It enables multiple Throttler
+//! instances to share rate limiting state.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────────┐
+//! │                     Distributed Rate Limiting                        │
+//! ├──────────────────────────────────────────────────────────────────────┤
+//! │                                                                      │
+//! │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
+//! │   │ Throttler 1  │    │ Throttler 2  │    │ Throttler N  │           │
+//! │   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘           │
+//! │          │                   │                   │                   │
+//! │          └───────────────────┼───────────────────┘                   │
+//! │                              ▼                                       │
+//! │                     ┌─────────────────┐                              │
+//! │                     │   Redis Server   │                             │
+//! │                     │                  │                             │
+//! │                     │  bucket:user1    │ ← JSON-encoded TokenBucket  │
+//! │                     │  bucket:user2    │                             │
+//! │                     │  bucket:api-key  │                             │
+//! │                     └─────────────────┘                              │
+//! │                                                                      │
+//! └──────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Atomic Operations
+//!
+//! The client uses Lua scripts for atomic token consumption, preventing
+//! race conditions when multiple instances access the same bucket:
+//!
+//! ```text
+//! Without Lua (race condition):           With Lua (atomic):
+//! ┌────────────┐  ┌────────────┐          ┌────────────┐  ┌────────────┐
+//! │ Instance A │  │ Instance B │          │ Instance A │  │ Instance B │
+//! ├────────────┤  ├────────────┤          ├────────────┤  ├────────────┤
+//! │ GET: 10    │  │ GET: 10    │          │ EVAL script│  │   wait...  │
+//! │ tokens -= 1│  │ tokens -= 1│          │ (atomic)   │  │            │
+//! │ SET: 9     │  │ SET: 9  ⚠️ │          │            │  │ EVAL script│
+//! └────────────┘  └────────────┘          └────────────┘  └────────────┘
+//!                 (Lost update!)                          (Both correct)
+//! ```
+//!
+//! ## Key Format
+//!
+//! Buckets are stored with the key format: `throttler:{key}`
+
 use redis::{Client, Commands, Connection};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::ThrottlerError;
 use crate::token_bucket::TokenBucket;
 
+/// Redis client wrapper for distributed token bucket storage.
+///
+/// Provides methods for storing, retrieving, and atomically updating
+/// token buckets in Redis. Uses Lua scripts to ensure atomic operations
+/// and prevent race conditions.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use throttler::redis::RedisClient;
+/// use throttler::token_bucket::TokenBucket;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = RedisClient::new("redis://localhost:6379")?;
+///
+/// // Store a bucket
+/// let bucket = TokenBucket::new(100, 10.0);
+/// client.set_token_bucket("user:123", &bucket, 3600)?;
+///
+/// // Retrieve a bucket
+/// if let Some(bucket) = client.get_token_bucket("user:123")? {
+///     println!("Tokens: {}", bucket.tokens);
+/// }
+///
+/// // Health check
+/// let pong = client.ping()?;
+/// assert_eq!(pong, "PONG");
+/// # Ok(())
+/// # }
+/// ```
 pub struct RedisClient {
+    /// The underlying Redis client
     client: Client,
 }
 
