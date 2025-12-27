@@ -275,6 +275,7 @@ await throttler.setRateLimit(
 | [Usage Examples](docs/examples.md)            | Python, Node.js, and middleware examples  |
 | [Monitoring Guide](docs/monitoring.md)        | Prometheus, Grafana, and alerting         |
 | [Troubleshooting](docs/troubleshooting.md)    | Common issues and solutions               |
+| [Contributing](CONTRIBUTING.md)               | Guidelines for contributors               |
 | [Changelog](CHANGELOG.md)                     | Version history and release notes         |
 
 ---
@@ -342,7 +343,9 @@ docker compose down -v
 
 ## Contributing
 
-Contributions are welcome! Please see our contributing guidelines.
+Contributions are welcome! Please read our **[Contributing Guide](CONTRIBUTING.md)** before submitting changes.
+
+### Quick Start for Contributors
 
 ```bash
 # Clone the repository
@@ -355,6 +358,13 @@ cargo test
 
 # Make your changes and submit a PR
 ```
+
+### Issue Templates
+
+We use GitHub issue templates to streamline contributions:
+
+- **[Report a Bug](https://github.com/psenger/throttler/issues/new?template=bug_report.md)** — Found a problem? Let us know
+- **[Request a Feature](https://github.com/psenger/throttler/issues/new?template=feature_request.md)** — Have an idea? We'd love to hear it
 
 ---
 
