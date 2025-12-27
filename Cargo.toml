@@ -2,10 +2,10 @@
 name = "throttler"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Philip A Senger"]
 description = "A lightweight Rust web API rate limiting and request throttling service"
 license = "MIT"
-repository = "https://github.com/yourusername/throttler"
+repository = "https://github.com/psenger/throttler"
 keywords = ["rate-limiting", "throttling", "web", "api", "redis"]
 categories = ["web-programming", "network-programming"]
 
